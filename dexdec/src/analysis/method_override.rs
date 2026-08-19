@@ -1386,7 +1386,6 @@ impl PlatformClassSet {
         }
     }
 
-    #[cfg(test)]
     fn is_frozen(&self) -> bool {
         matches!(self.details.read().as_deref(), Ok(DetailsTable::Frozen(_)))
     }
@@ -1405,6 +1404,13 @@ pub fn freeze_default_platform_class_details() {
     if let Ok(platform) = PlatformClassSet::default_cached() {
         platform.freeze_details();
     }
+}
+
+#[doc(hidden)]
+pub fn default_platform_class_details_are_frozen() -> bool {
+    PlatformClassSet::default_cached()
+        .ok()
+        .is_some_and(|platform| platform.is_frozen())
 }
 
 fn platform_class_details(class: &PlatformClass) -> io::Result<ClassDetails> {

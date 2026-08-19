@@ -68,6 +68,10 @@ fn frozen_platform_details_still_resolve_unseen_contracts() {
         .expect("warm Comparator.compare before freeze");
 
     dexdec::analysis::method_override::freeze_default_platform_class_details();
+    assert!(
+        dexdec::analysis::method_override::default_platform_class_details_are_frozen(),
+        "freeze hook must freeze the shared default PlatformClassSet"
+    );
 
     let method = "Ljava/util/ArrayList;-><init>(Ljava/util/Collection;)V"
         .parse()

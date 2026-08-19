@@ -528,6 +528,7 @@ impl DecompilerContext {
         let revision = self.reader.loaded_classes_revision();
         if let Some((cached_revision, hierarchy)) = &self.type_hierarchy_cache {
             if *cached_revision == revision {
+                crate::analysis::method_override::freeze_default_platform_class_details();
                 return Ok(Arc::clone(hierarchy));
             }
         }
@@ -536,6 +537,7 @@ impl DecompilerContext {
                 .map_err(crate::frontend::DexError::from)?,
         );
         self.type_hierarchy_cache = Some((revision, Arc::clone(&hierarchy)));
+        crate::analysis::method_override::freeze_default_platform_class_details();
         Ok(hierarchy)
     }
 

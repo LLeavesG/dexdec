@@ -1578,7 +1578,8 @@ pub(crate) fn type_hierarchy_index(reader: &DexFileReader) -> OverrideResult<Cla
 }
 
 fn freeze_shared_hierarchy(index: &mut ClassHierarchyIndex) {
-    // DEXDEC_HIERARCHY_LAZY=1 keeps a shared Building table for A/B comparison.
+    // DEXDEC_HIERARCHY_LAZY=1 skips precomputation. Read at OnceLock fill and
+    // each type_hierarchy_index call.
     if hierarchy_lazy_distances() {
         return;
     }

@@ -73,6 +73,10 @@ impl ClassHierarchyIndex {
         }
     }
 
+    /// Precompute ancestor distances for every known type and freeze the table.
+    ///
+    /// After freeze, lookups are lock-free. Unknown starts still run a one-shot
+    /// BFS and are not stored. Further graph mutation panics.
     pub fn freeze_distances(&mut self) {
         if matches!(self.distances, DistanceTable::Frozen(_)) {
             return;
@@ -91,6 +95,11 @@ impl ClassHierarchyIndex {
         self.frozen_required = required;
     }
 
+    /// Record `class` and its direct parents.
+    ///
+    /// # Panics
+    ///
+    /// Panics if distances have been frozen.
     pub fn add(&mut self, class: impl Into<String>, parents: impl IntoIterator<Item = String>) {
         self.require_building();
         self.parents
@@ -100,6 +109,11 @@ impl ClassHierarchyIndex {
         self.clear_building_distances();
     }
 
+    /// Record a declared reference type and its direct parents.
+    ///
+    /// # Panics
+    ///
+    /// Panics if distances have been frozen.
     pub fn add_declared_type(
         &mut self,
         class: impl Into<String>,
@@ -111,6 +125,11 @@ impl ClassHierarchyIndex {
         self.reference_types.insert(class, info);
     }
 
+    /// Record many declared reference types.
+    ///
+    /// # Panics
+    ///
+    /// Panics if distances have been frozen.
     pub fn extend_declared_types(
         &mut self,
         declarations: impl IntoIterator<Item = (String, Vec<String>, ReferenceTypeInfo)>,
@@ -367,5 +386,95 @@ mod tests {
         let mut index = sample_hierarchy();
         index.freeze_distances();
         index.add("pkg/Other", Vec::<String>::new());
+    }
+
+    #[test]
+    fn freeze_preserves_subtype_and_lcs() {
+        let mut index = sample_hierarchy();
+        index.add("pkg/Left", ["pkg/Shared".to_string()]);
+        index.add("pkg/Right", ["pkg/Shared".to_string()]);
+        index.add("pkg/Shared", ["java/lang/Object".to_string()]);
+        let pairs = [
+            ("pkg/Child", "pkg/Parent"),
+            ("pkg/Parent", "pkg/Child"),
+            ("pkg/Child", "java/lang/Object"),
+            ("pkg/Orphan", "pkg/Child"),
+            ("pkg/Left", "pkg/Right"),
+            ("pkg/Right", "pkg/Left"),
+            ("pkg/Left", "pkg/Shared"),
+        ];
+        let before_rel: Vec<_> = pairs
+            .iter()
+            .map(|(left, right)| index.subtype_relation(left, right))
+            .collect();
+        let before_lcs: Vec<_> = pairs
+            .iter()
+            .map(|(left, right)| index.least_common_supertype(left, right))
+            .collect();
+        index.freeze_distances();
+        let after_rel: Vec<_> = pairs
+            .iter()
+            .map(|(left, right)| index.subtype_relation(left, right))
+            .collect();
+        let after_lcs: Vec<_> = pairs
+            .iter()
+            .map(|(left, right)| index.least_common_supertype(left, right))
+            .collect();
+        assert_eq!(before_rel, after_rel);
+        assert_eq!(before_lcs, after_lcs);
+        assert_eq!(
+            index.least_common_supertype("pkg/Left", "pkg/Right"),
+            Some("pkg/Shared".to_string())
+        );
+    }
+
+    #[test]
+    fn frozen_miss_does_not_grow_the_map() {
+        let mut index = sample_hierarchy();
+        index.freeze_distances();
+        let keys_before = frozen_keys(&index);
+        assert!(!keys_before.contains("not/A/Key"));
+        let first = index.distances("not/A/Key");
+        let second = index.distances("not/A/Key");
+        assert_eq!(first.get("not/A/Key").copied(), Some(0));
+        assert_eq!(*first, *second);
+        assert_eq!(frozen_keys(&index), keys_before);
+    }
+
+    #[test]
+    fn layered_freeze_includes_base_keys() {
+        let mut base = ClassHierarchyIndex::default();
+        base.add("android/view/View", ["java/lang/Object".to_string()]);
+        base.add("java/lang/Object", Vec::<String>::new());
+        base.freeze_distances();
+        let mut index = ClassHierarchyIndex::layered(Arc::new(base));
+        index.add("pkg/MyView", ["android/view/View".to_string()]);
+        index.freeze_distances();
+        let keys = frozen_keys(&index);
+        assert!(keys.contains("android/view/View"));
+        assert!(keys.contains("java/lang/Object"));
+        assert!(keys.contains("pkg/MyView"));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot mutate a frozen ClassHierarchyIndex")]
+    fn extend_declared_types_on_frozen_panics() {
+        let mut index = sample_hierarchy();
+        index.freeze_distances();
+        index.extend_declared_types([(
+            "pkg/Other".to_string(),
+            Vec::new(),
+            ReferenceTypeInfo {
+                is_interface: false,
+                is_final: false,
+            },
+        )]);
+    }
+
+    fn frozen_keys(index: &ClassHierarchyIndex) -> HashSet<String> {
+        match &index.distances {
+            DistanceTable::Frozen(map) => map.keys().cloned().collect(),
+            DistanceTable::Building(_) => panic!("expected frozen distance table"),
+        }
     }
 }

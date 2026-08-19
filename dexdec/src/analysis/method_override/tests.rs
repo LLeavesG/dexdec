@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::BTreeMap;
 
+use crate::frontend::{ClassInfo, MethodInfo};
+
 #[test]
 fn loads_platform_symbol_methods() {
     let platform = PlatformClassSet::load_default().expect("platform symbols should load");
@@ -102,6 +104,110 @@ fn resolves_declared_platform_generic_method_contract() {
         contract.signature,
         GenericSignatures::method("(TT;TT;)I").expect("generic method signature")
     );
+}
+
+fn assert_overloads_match_walk(
+    hierarchy: &GenericTypeHierarchy,
+    method: &str,
+) -> (crate::ir::MethodReference, Vec<crate::ir::MethodReference>) {
+    let method = method
+        .parse::<crate::ir::MethodReference>()
+        .expect("method reference");
+    let indexed = hierarchy.method_overloads(&method);
+    let walked = hierarchy.method_overloads_walk(&method);
+    assert_eq!(
+        indexed, walked,
+        "index must match class_details BTreeSet walk for {}",
+        method.owner
+    );
+    assert!(indexed.iter().all(|candidate| {
+        candidate.owner == method.owner
+            && candidate.name == method.name
+            && candidate.descriptor.parameters.len() == method.descriptor.parameters.len()
+    }));
+    (method, indexed)
+}
+
+fn class_with_methods(
+    descriptor: &str,
+    super_class: Option<&str>,
+    methods: &[(&str, Vec<ArgType>, ArgType)],
+) -> ClassNode {
+    let info = ClassInfo::from_type_descriptor(descriptor).expect("class descriptor");
+    let mut class = ClassNode::new(0, info, AccessInfo::for_class(0x0001));
+    if let Some(super_class) = super_class {
+        class.set_super_class(super_class.parse().expect("super class"));
+    }
+    for (index, (name, parameters, return_type)) in methods.iter().enumerate() {
+        class.add_method(MethodNode::new(
+            index as u32,
+            MethodInfo::new(
+                descriptor.to_string(),
+                name.to_string(),
+                parameters.clone(),
+                return_type.clone(),
+            ),
+            AccessInfo::for_method(0x0001),
+        ));
+    }
+    class
+}
+
+#[test]
+fn method_overloads_index_matches_inherited_platform_walk() {
+    let hierarchy =
+        GenericTypeHierarchy::from_classes(std::iter::empty::<&ClassNode>()).expect("hierarchy");
+    let (method, overloads) = assert_overloads_match_walk(
+        &hierarchy,
+        "Ljava/util/ArrayList;->remove(Ljava/lang/Object;)Z",
+    );
+    assert!(
+        overloads.len() > 1,
+        "ArrayList.remove should include inherited same-arity descriptors, got {overloads:?}"
+    );
+    assert!(
+        overloads.iter().any(|candidate| {
+            candidate.descriptor.parameters.as_slice() == [ArgType::object("java/lang/Object")]
+        }),
+        "expected remapped remove(Object), got {overloads:?}"
+    );
+    assert_eq!(overloads, hierarchy.method_overloads(&method));
+}
+
+#[test]
+fn method_overloads_index_matches_loaded_parent_descriptor_walk() {
+    let parent = class_with_methods(
+        "Lcom/example/Parent;",
+        None,
+        &[
+            (
+                "foo",
+                vec![ArgType::object("java/lang/Object")],
+                ArgType::VOID,
+            ),
+            ("foo", vec![ArgType::string()], ArgType::VOID),
+        ],
+    );
+    let child = class_with_methods(
+        "Lcom/example/Child;",
+        Some("Lcom/example/Parent;"),
+        &[(
+            "foo",
+            vec![ArgType::object("java/lang/Object")],
+            ArgType::VOID,
+        )],
+    );
+    let hierarchy = GenericTypeHierarchy::from_classes([&parent, &child]).expect("hierarchy");
+    let (method, overloads) =
+        assert_overloads_match_walk(&hierarchy, "Lcom/example/Child;->foo(Ljava/lang/Object;)V");
+    assert!(
+        overloads.iter().any(|candidate| {
+            candidate.owner == method.owner
+                && candidate.descriptor.parameters.as_slice() == [ArgType::string()]
+        }),
+        "parent foo(String) must remap onto Child, got {overloads:?}"
+    );
+    assert_eq!(overloads, hierarchy.method_overloads(&method));
 }
 
 #[test]

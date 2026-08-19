@@ -853,13 +853,13 @@ impl DexFileReader {
         self.mark_override_analysis_dirty();
     }
 
-    /// Drop loaded class nodes without running their destructors.
+    /// Drop loaded class nodes after archive collect clones render inputs.
     ///
-    /// Full-archive decompilation clones what it still needs into render jobs.
-    /// Destroying the leftover graph at process shutdown is pure overhead.
+    /// Marks override analysis dirty so a later request cannot reuse Ready
+    /// state on an empty graph. CLI process exit may still `mem::forget` the
+    /// whole `Decompiler` to skip remaining destructor time.
     pub(crate) fn abandon_loaded_classes(&mut self) {
-        let classes = std::mem::take(&mut self.classes);
-        std::mem::forget(classes);
+        self.clear_loaded_classes();
     }
 
     /// Get the index of the DEX file containing the class

@@ -475,8 +475,12 @@ impl Decompiler {
 
     /// Generate many classes while reusing the loaded archive graph.
     ///
-    /// This is the full-archive path: shared hierarchy/ABI, one decode pass,
-    /// one termination solve, then class generation in parallel.
+    /// Shared hierarchy/ABI, one decode pass, one termination solve, then
+    /// class generation in parallel. This loads the requested classes (and
+    /// nested types when `include_nested`) itself; callers need not
+    /// `load_all_classes()`. After collect, leftover frontend/IR buffers are
+    /// dropped. Later requests on the same `Decompiler` must load classes
+    /// again.
     pub fn generate_classes(
         &mut self,
         classes: Vec<(String, SourceLanguage)>,
@@ -509,6 +513,23 @@ impl Decompiler {
         let needs_kotlin = classes
             .iter()
             .any(|(_, language)| *language == SourceLanguage::Kotlin);
+        let include_nested = self.options.include_nested;
+        self.context.load_archive_selection(
+            classes.iter().map(|(class, _)| class.as_str()),
+            include_nested,
+        )?;
+        self.context.set_retain_decoded_methods(true);
+        let generated = self.generate_archive_classes(classes, needs_java, needs_kotlin);
+        self.context.set_retain_decoded_methods(false);
+        generated
+    }
+
+    fn generate_archive_classes(
+        &mut self,
+        classes: Vec<(String, SourceLanguage)>,
+        needs_java: bool,
+        needs_kotlin: bool,
+    ) -> Result<Vec<Result<SourceUnit, ClassFailure>>, DecompileError> {
         let stats = batch_stats_enabled();
         let t0 = Instant::now();
         self.context.prepare_archive_overrides()?;
@@ -568,7 +589,12 @@ impl Decompiler {
         }
 
         let collect_ms = t4.elapsed();
+        self.context
+            .prepare_archive_source_abi(needs_java, needs_kotlin)?;
         let hierarchy = self.context.type_hierarchy()?;
+        if needs_java {
+            self.context.prepare_java_source_abi()?;
+        }
         let java_abi = if needs_java {
             self.context.java_source_abi()
         } else {
@@ -767,8 +793,12 @@ struct ArchiveClassJob {
 }
 
 fn archive_java_parallel_methods() -> bool {
-    // A/B only: class-parallel archive jobs serialize method bodies by default.
-    std::env::var_os("DEXDEC_ARCHIVE_METHOD_PARALLEL").is_some_and(|value| value == "1")
+    archive_java_parallel_methods_from(std::env::var_os("DEXDEC_ARCHIVE_METHOD_PARALLEL"))
+}
+
+fn archive_java_parallel_methods_from(value: Option<std::ffi::OsString>) -> bool {
+    // Exact "1" is the A/B override; any other value stays serialized.
+    value.as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
 fn render_archive_job(
@@ -875,13 +905,43 @@ mod tests {
 
     #[test]
     fn archive_java_jobs_disable_method_parallelism() {
-        assert!(
-            !archive_java_parallel_methods(),
-            "archive jobs must serialize Java method bodies by default"
-        );
-        let decompiler = JavaDecompiler::new(JavaDecompilerConfig::default())
-            .with_parallel_methods(archive_java_parallel_methods());
+        assert!(!archive_java_parallel_methods_from(None));
+        assert!(!archive_java_parallel_methods_from(Some("0".into())));
+        assert!(archive_java_parallel_methods_from(Some("1".into())));
+        let decompiler =
+            JavaDecompiler::new(JavaDecompilerConfig::default()).with_parallel_methods(false);
         assert!(!decompiler.parallel_methods());
+    }
+
+    #[test]
+    fn generate_classes_loads_requested_classes_without_full_archive() {
+        let dex = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/testcases/classes.dex");
+        let mut decompiler = Decompiler::open(dex).expect("open test DEX");
+        decompiler.set_options(
+            DecompileOptions::default()
+                .with_language(SourceLanguage::Java)
+                .with_isolated_requests(false),
+        );
+        let results = decompiler
+            .generate_classes(vec![
+                ("LHelloWorld;".into(), SourceLanguage::Java),
+                ("LSimpleIf;".into(), SourceLanguage::Java),
+            ])
+            .expect("generate requested classes");
+        assert_eq!(results.len(), 2);
+        for result in results {
+            result.expect("requested class should decompile without load_all_classes");
+        }
+        let again = decompiler
+            .generate_classes(vec![
+                ("LHelloWorld;".into(), SourceLanguage::Java),
+                ("LSimpleIf;".into(), SourceLanguage::Java),
+            ])
+            .expect("second archive pass after abandon");
+        assert_eq!(again.len(), 2);
+        for result in again {
+            result.expect("abandoned buffers must not poison a later archive pass");
+        }
     }
 
     #[test]

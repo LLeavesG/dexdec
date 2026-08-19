@@ -425,6 +425,23 @@ impl JavaDecompiler {
             }
             if let Some(model) = recovered_models.remove(&index) {
                 built.push(model);
+            } else {
+                let decoded_method = methods[index].method();
+                let failure = MethodRecoveryFailure::new(
+                    MethodRecoveryStage::Decode,
+                    "decoded CFG is missing",
+                );
+                failure.observe(
+                    self.observer.as_ref(),
+                    class.type_descriptor(),
+                    &decoded_method.info.name,
+                    &decoded_method.info.descriptor(),
+                );
+                built.push(JavaMethodModel::from_failure(
+                    class,
+                    decoded_method,
+                    failure,
+                ));
             }
         }
         Ok((built, outer_instance))

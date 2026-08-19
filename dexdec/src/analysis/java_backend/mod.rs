@@ -64,8 +64,6 @@ pub struct JavaDecompiler {
     type_hierarchy: Arc<ClassHierarchyIndex>,
     observer: Arc<dyn crate::ir::AnalysisObserver>,
     source_abi: Arc<JavaSourceAbi>,
-    /// Isolate single-class work keeps this true. Archive class-parallel jobs
-    /// set it false so method `par_iter` does not nest inside class `par_iter`.
     parallel_methods: bool,
 }
 

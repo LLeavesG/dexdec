@@ -56,6 +56,9 @@ pub struct DecompilerContext {
     method_irs: HashMap<String, HashMap<String, CFG>>,
     /// Revision of the loaded class graph captured by `method_irs`.
     method_cache_revision: u64,
+    /// Archive collect may load extra ABI types after termination; keep
+    /// already-decoded CFGs across those revision bumps.
+    retain_decoded_methods: bool,
     /// Immutable hierarchy facts shared by every method in one class-graph revision.
     type_hierarchy_cache: Option<(u64, Arc<crate::ir::analysis::ClassHierarchyIndex>)>,
     /// Immutable target-language ABI facts shared by one class-graph revision.
@@ -184,6 +187,7 @@ impl DecompilerContext {
             reader,
             method_irs: HashMap::new(),
             method_cache_revision: 0,
+            retain_decoded_methods: false,
             type_hierarchy_cache: None,
             java_source_abi_cache: None,
             kotlin_source_abi_cache: None,
@@ -290,10 +294,58 @@ impl DecompilerContext {
         self.method_cache_revision = self.reader.loaded_classes_revision();
     }
 
+    pub(crate) fn set_retain_decoded_methods(&mut self, retain: bool) {
+        self.retain_decoded_methods = retain;
+    }
+
+    fn sync_method_cache_revision(&mut self) {
+        if self.method_cache_revision == self.reader.loaded_classes_revision() {
+            return;
+        }
+        if !self.retain_decoded_methods {
+            self.method_irs.clear();
+        }
+        self.method_cache_revision = self.reader.loaded_classes_revision();
+    }
+
     pub(crate) fn abandon_archive_buffers(&mut self) {
-        let method_irs = std::mem::take(&mut self.method_irs);
-        std::mem::forget(method_irs);
+        self.retain_decoded_methods = false;
+        self.method_irs.clear();
         self.reader.abandon_loaded_classes();
+        self.method_cache_revision = self.reader.loaded_classes_revision();
+    }
+
+    pub(crate) fn load_archive_selection<'a>(
+        &mut self,
+        class_names: impl IntoIterator<Item = &'a str>,
+        include_nested: bool,
+    ) -> Result<(), DecompileError> {
+        for class_name in class_names {
+            self.reader.load_class(class_name)?;
+            if include_nested {
+                self.load_nested_class_types(class_name)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn load_nested_class_types(&mut self, class_name: &str) -> Result<(), DecompileError> {
+        let mut pending = self
+            .reader
+            .get_class(class_name)
+            .map(|class| class.inner_class_names().to_vec())
+            .unwrap_or_default();
+        let mut seen = std::collections::BTreeSet::from([class_name.to_string()]);
+        while let Some(nested) = pending.pop() {
+            if !seen.insert(nested.clone()) {
+                continue;
+            }
+            self.reader.load_class(&nested)?;
+            if let Some(class) = self.reader.get_class(&nested) {
+                pending.extend(class.inner_class_names().iter().cloned());
+            }
+        }
+        Ok(())
     }
 
     /// Begin a fresh request-local class graph without reparsing DEX metadata.
@@ -316,10 +368,7 @@ impl DecompilerContext {
         method_name: &str,
         descriptor: Option<&str>,
     ) -> DexResult<Option<&CFG>> {
-        if self.method_cache_revision != self.reader.loaded_classes_revision() {
-            self.method_irs.clear();
-            self.method_cache_revision = self.reader.loaded_classes_revision();
-        }
+        self.sync_method_cache_revision();
         // Form a cache key that includes descriptor to handle overloading
         let cache_key = if let Some(desc) = descriptor {
             format!("{}{}", method_name, desc)
@@ -1083,10 +1132,7 @@ impl DecompilerContext {
 
     pub(crate) fn prefetch_decoded_methods(&mut self) -> Result<(), DecompileError> {
         crate::profile_scope!("api.prefetch_decoded_methods", {
-            if self.method_cache_revision != self.reader.loaded_classes_revision() {
-                self.method_irs.clear();
-                self.method_cache_revision = self.reader.loaded_classes_revision();
-            }
+            self.sync_method_cache_revision();
 
             let mut specs = Vec::new();
             for class in self.reader.classes() {
@@ -1126,12 +1172,14 @@ impl DecompilerContext {
             let decoded = specs
                 .into_par_iter()
                 .map(|spec| spec.decode(reader))
-                .collect::<Result<Vec<_>, _>>()?;
-            for (class_name, cache_key, ir) in decoded {
-                self.method_irs
-                    .entry(class_name)
-                    .or_default()
-                    .insert(cache_key, ir);
+                .collect::<Vec<_>>();
+            for result in decoded {
+                if let Ok((class_name, cache_key, ir)) = result {
+                    self.method_irs
+                        .entry(class_name)
+                        .or_default()
+                        .insert(cache_key, ir);
+                }
             }
             Ok(())
         })

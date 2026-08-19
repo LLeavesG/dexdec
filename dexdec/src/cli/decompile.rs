@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::{ClassSelector, DecompileOptions, Decompiler, MethodRequest, SourceLanguage};
+use crate::{
+    ClassFailure, ClassSelector, DecompileOptions, Decompiler, MethodRequest, SourceLanguage,
+    SourceUnit,
+};
 
 use super::error::{CliError, CliResult};
 use super::model::{DecompileRequest, ExitStatus, LanguageSelection, OutputFormat};
@@ -69,7 +72,7 @@ impl DecompileCommand {
         }
         Self::validate_destination(request, classes.len())?;
 
-        let isolate_requests = classes.len() <= 1;
+        let isolate_requests = request.fail_fast || classes.len() <= 1;
         let options = DecompileOptions::default()
             .with_nested(request.include_nested)
             .with_isolated_requests(isolate_requests);
@@ -109,7 +112,11 @@ impl DecompileCommand {
             context.progress(&format!("preparing {} classes", jobs.len()))?;
         }
         let generate_started = std::time::Instant::now();
-        let generated = decompiler.generate_classes(jobs)?;
+        let generated = if request.fail_fast {
+            Self::generate_classes_fail_fast(&mut decompiler, jobs)
+        } else {
+            decompiler.generate_classes(jobs)?
+        };
         let generate_wall = generate_started.elapsed();
         let write_started = std::time::Instant::now();
         for unit in generated {
@@ -208,6 +215,32 @@ impl DecompileCommand {
             std::mem::forget(decompiler);
         }
         Ok(status)
+    }
+
+    fn generate_classes_fail_fast(
+        decompiler: &mut Decompiler,
+        jobs: Vec<(String, SourceLanguage)>,
+    ) -> Vec<Result<SourceUnit, ClassFailure>> {
+        let mut generated = Vec::with_capacity(jobs.len());
+        for (class, language) in jobs {
+            decompiler.set_options(decompiler.options().clone().with_language(language));
+            let method_count = decompiler
+                .reader()
+                .get_class(&class)
+                .map_or(0, |node| node.methods().len());
+            match decompiler.class(class.clone()) {
+                Ok(unit) => generated.push(Ok(unit)),
+                Err(error) => {
+                    generated.push(Err(ClassFailure {
+                        class,
+                        method_count,
+                        error,
+                    }));
+                    break;
+                }
+            }
+        }
+        generated
     }
 
     fn method<H: CliHost>(

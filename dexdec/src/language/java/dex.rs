@@ -30,7 +30,7 @@ use super::members::JavaMemberNames;
 use super::source_types::{
     invocation_expression_signature, GenericInvocationCompatibility, GenericTypeEvidence,
     GenericTypeProjection, GenericTypeRelation, GenericTypeSolver, JavaTypeRelations,
-    SourceTypeFlow,
+    SourceObjectTypes, SourceTypeFlow,
 };
 use input::JavaInputVerifier;
 
@@ -198,7 +198,7 @@ pub struct DexJavaDialect {
     primitive_expression_types: RefCell<BTreeMap<InstructionId, Option<PrimitiveType>>>,
     source_field_types: Arc<BTreeMap<FieldReference, JavaType>>,
     generic_fields: Arc<BTreeMap<FieldReference, GenericFieldContract>>,
-    source_object_types: Arc<BTreeMap<ArgType, JavaType>>,
+    source_object_types: Arc<SourceObjectTypes>,
     generic_methods: Arc<BTreeMap<MethodReference, GenericMethodContract>>,
     generic_type_projection: Option<Rc<dyn GenericTypeProjection>>,
     declared: BTreeSet<JavaIdentifier>,
@@ -354,7 +354,7 @@ impl DexJavaDialect {
             primitive_expression_types: RefCell::new(BTreeMap::new()),
             source_field_types: Arc::new(BTreeMap::new()),
             generic_fields: Arc::new(BTreeMap::new()),
-            source_object_types: Arc::new(BTreeMap::new()),
+            source_object_types: Arc::new(SourceObjectTypes::default()),
             generic_methods: Arc::new(BTreeMap::new()),
             generic_type_projection: None,
             declared: BTreeSet::new(),
@@ -434,7 +434,7 @@ impl DexJavaDialect {
         self
     }
 
-    pub fn with_source_object_types(mut self, types: Arc<BTreeMap<ArgType, JavaType>>) -> Self {
+    pub(crate) fn with_source_object_types(mut self, types: Arc<SourceObjectTypes>) -> Self {
         self.source_object_types = types;
         self
     }

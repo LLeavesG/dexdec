@@ -185,7 +185,7 @@ impl JavaMethodBody {
                 crate::ir::generic_types::GenericMethodContract,
             >,
         >,
-        source_object_types: std::sync::Arc<std::collections::BTreeMap<ArgType, JavaType>>,
+        source_object_types: std::sync::Arc<crate::language::java::SourceObjectTypes>,
         generic_type_projection: std::rc::Rc<dyn crate::language::java::GenericTypeProjection>,
         source_current_type: Option<JavaType>,
         source_super_type: Option<JavaType>,
@@ -349,6 +349,10 @@ impl JavaMethodBody {
 
     pub fn type_uses(&self) -> impl Iterator<Item = &ArgType> {
         self.type_uses.iter()
+    }
+
+    pub(in crate::analysis::java_backend) fn current_type(&self) -> Option<&ArgType> {
+        self.current_type.as_ref()
     }
 
     pub fn is_empty(body: &crate::language::java::JavaMethodBody) -> bool {

@@ -594,12 +594,13 @@ impl<'a> LexicalTypeEnvironment<'a> {
 /// Source-level constructor layouts recovered from DEX class metadata.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JavaSourceAbi {
-    constructors: Vec<JavaConstructorLayout>,
+    constructors: BTreeMap<MethodReference, JavaConstructorLayout>,
     methods: Vec<MethodReference>,
     owner_types: std::collections::BTreeMap<ArgType, ClassTypeSignature>,
     lexical_type_parameters: std::collections::BTreeMap<ArgType, Vec<TypeParameter>>,
     inherited_member_types: BTreeMap<ArgType, BTreeSet<(JavaIdentifier, ArgType)>>,
     outer_instances: std::collections::BTreeMap<FieldReference, ArgType>,
+    outer_instance_by_owner: BTreeMap<ArgType, FieldReference>,
     field_types: std::collections::BTreeMap<FieldReference, GenericFieldContract>,
     method_exceptions: std::collections::BTreeMap<MethodReference, Vec<ArgType>>,
     platform_exceptions: std::sync::Arc<std::collections::BTreeMap<MethodReference, Vec<ArgType>>>,
@@ -609,6 +610,7 @@ pub(crate) struct JavaSourceAbi {
         Vec<(ArgType, GenericMethodContract)>,
     >,
     function_object_types: std::collections::BTreeMap<ArgType, JvmTypeSignature>,
+    function_object_identities: std::sync::Arc<BTreeSet<ArgType>>,
     externally_referenced_nested_types: BTreeSet<ArgType>,
     inaccessible_top_level_imports: BTreeSet<String>,
     generic_hierarchy: Option<crate::analysis::method_override::GenericTypeHierarchy>,
@@ -629,6 +631,10 @@ impl JavaSourceAbi {
             .iter()
             .filter_map(|class| OuterInstanceField::analyze(class))
             .map(|outer| (outer.reference, outer.outer_type))
+            .collect::<BTreeMap<_, _>>();
+        let outer_instance_by_owner = outer_instances
+            .iter()
+            .map(|(field, _)| (field.owner.clone(), field.clone()))
             .collect();
         let constructor_owner_types = &open_owners;
         let constructors = classes
@@ -638,6 +644,15 @@ impl JavaSourceAbi {
                 class.constructors().filter_map(move |constructor| {
                     ConstructorSourceAbi::analyze(class, constructor, constructor_owner_types)
                         .and_then(|abi| abi.layout(class, constructor))
+                        .map(|layout| {
+                            (
+                                Self::constructor_reference(
+                                    class.class_type().clone(),
+                                    constructor.param_types(),
+                                ),
+                                layout,
+                            )
+                        })
                 })
             })
             .collect();
@@ -819,12 +834,14 @@ impl JavaSourceAbi {
             lexical_type_parameters,
             inherited_member_types,
             outer_instances,
+            outer_instance_by_owner,
             field_types,
             method_exceptions,
             platform_exceptions,
             generic_methods,
             generic_method_declarations,
             function_object_types: std::collections::BTreeMap::new(),
+            function_object_identities: std::sync::Arc::new(BTreeSet::new()),
             externally_referenced_nested_types,
             inaccessible_top_level_imports,
             generic_hierarchy,
@@ -859,23 +876,45 @@ impl JavaSourceAbi {
                 Some((class.class_type().clone(), inferred.interface().clone()))
             })
             .collect();
+        abi.function_object_identities =
+            std::sync::Arc::new(abi.function_object_types.keys().cloned().collect());
         abi
     }
 
     pub(crate) fn constructors(&self) -> impl Iterator<Item = JavaConstructorLayout> + '_ {
-        self.constructors.iter().cloned()
+        self.constructors.values().cloned()
     }
 
     pub(crate) fn referenced_constructors<'a>(
         &self,
         methods: impl IntoIterator<Item = &'a MethodReference>,
     ) -> Vec<JavaConstructorLayout> {
-        let references = methods.into_iter().collect::<Vec<_>>();
-        self.constructors
-            .iter()
-            .filter(|layout| references.iter().any(|reference| layout.matches(reference)))
-            .cloned()
+        methods
+            .into_iter()
+            .filter(|reference| reference.is_constructor())
+            .filter_map(|reference| {
+                self.constructors
+                    .get(reference)
+                    .or_else(|| {
+                        self.constructors.get(&Self::constructor_reference(
+                            reference.owner.clone(),
+                            &reference.descriptor.parameters,
+                        ))
+                    })
+                    .cloned()
+            })
             .collect()
+    }
+
+    fn constructor_reference(owner: ArgType, parameters: &[ArgType]) -> MethodReference {
+        MethodReference {
+            owner,
+            name: "<init>".to_string(),
+            descriptor: crate::ir::MethodDescriptor {
+                parameters: parameters.to_vec(),
+                return_type: ArgType::VOID,
+            },
+        }
     }
 
     pub(crate) fn methods(&self) -> impl Iterator<Item = MethodReference> + '_ {
@@ -1129,6 +1168,53 @@ impl JavaSourceAbi {
         &self,
     ) -> impl Iterator<Item = (&ArgType, &JvmTypeSignature)> {
         self.function_object_types.iter()
+    }
+
+    pub(crate) fn referenced_function_object_types<'a>(
+        &self,
+        types: impl IntoIterator<Item = &'a ArgType>,
+    ) -> BTreeMap<ArgType, JvmTypeSignature> {
+        types
+            .into_iter()
+            .filter_map(|ty| {
+                self.function_object_types
+                    .get(ty)
+                    .cloned()
+                    .map(|signature| (ty.clone(), signature))
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_function_object_identity(&self, ty: &ArgType) -> bool {
+        self.function_object_identities.contains(ty)
+    }
+
+    pub(crate) fn expected_function_object_identities<'a>(
+        &self,
+        types: impl IntoIterator<Item = &'a ArgType>,
+        extra: impl IntoIterator<Item = ArgType>,
+    ) -> std::sync::Arc<BTreeSet<ArgType>> {
+        let mut identities = extra.into_iter().collect::<BTreeSet<_>>();
+        for ty in types {
+            if self.is_function_object_identity(ty) {
+                identities.insert(ty.clone());
+            }
+        }
+        std::sync::Arc::new(identities)
+    }
+
+    pub(crate) fn referenced_outer_instances<'a>(
+        &self,
+        types: impl IntoIterator<Item = &'a ArgType>,
+    ) -> BTreeMap<FieldReference, ArgType> {
+        types
+            .into_iter()
+            .filter_map(|ty| {
+                let field = self.outer_instance_by_owner.get(ty)?;
+                let outer = self.outer_instances.get(field)?;
+                Some((field.clone(), outer.clone()))
+            })
+            .collect()
     }
 
     pub(crate) fn nested_type_requires_external_access(&self, ty: &ArgType) -> bool {

@@ -646,14 +646,10 @@ impl JavaSourceAbi {
                         .and_then(|abi| abi.layout(class, constructor))
                         .map(|layout| {
                             (
-                                MethodReference {
-                                    owner: class.class_type().clone(),
-                                    name: constructor.name().to_string(),
-                                    descriptor: crate::ir::MethodDescriptor {
-                                        parameters: constructor.param_types().to_vec(),
-                                        return_type: constructor.return_type().clone(),
-                                    },
-                                },
+                                Self::constructor_reference(
+                                    class.class_type().clone(),
+                                    constructor.param_types(),
+                                ),
                                 layout,
                             )
                         })
@@ -895,8 +891,30 @@ impl JavaSourceAbi {
     ) -> Vec<JavaConstructorLayout> {
         methods
             .into_iter()
-            .filter_map(|reference| self.constructors.get(reference).cloned())
+            .filter(|reference| reference.is_constructor())
+            .filter_map(|reference| {
+                self.constructors
+                    .get(reference)
+                    .or_else(|| {
+                        self.constructors.get(&Self::constructor_reference(
+                            reference.owner.clone(),
+                            &reference.descriptor.parameters,
+                        ))
+                    })
+                    .cloned()
+            })
             .collect()
+    }
+
+    fn constructor_reference(owner: ArgType, parameters: &[ArgType]) -> MethodReference {
+        MethodReference {
+            owner,
+            name: "<init>".to_string(),
+            descriptor: crate::ir::MethodDescriptor {
+                parameters: parameters.to_vec(),
+                return_type: ArgType::VOID,
+            },
+        }
     }
 
     pub(crate) fn methods(&self) -> impl Iterator<Item = MethodReference> + '_ {
@@ -1167,8 +1185,22 @@ impl JavaSourceAbi {
             .collect()
     }
 
-    pub(crate) fn function_object_identities(&self) -> std::sync::Arc<BTreeSet<ArgType>> {
-        std::sync::Arc::clone(&self.function_object_identities)
+    pub(crate) fn is_function_object_identity(&self, ty: &ArgType) -> bool {
+        self.function_object_identities.contains(ty)
+    }
+
+    pub(crate) fn expected_function_object_identities<'a>(
+        &self,
+        types: impl IntoIterator<Item = &'a ArgType>,
+        extra: impl IntoIterator<Item = ArgType>,
+    ) -> std::sync::Arc<BTreeSet<ArgType>> {
+        let mut identities = extra.into_iter().collect::<BTreeSet<_>>();
+        for ty in types {
+            if self.is_function_object_identity(ty) {
+                identities.insert(ty.clone());
+            }
+        }
+        std::sync::Arc::new(identities)
     }
 
     pub(crate) fn referenced_outer_instances<'a>(

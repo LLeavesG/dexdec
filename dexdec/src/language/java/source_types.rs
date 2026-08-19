@@ -18,9 +18,11 @@ use super::{JavaClassType, JavaClassTypeSegment, JavaIdentifier, JavaType, JavaT
 
 /// Function-object identities visible to Java body lowering.
 ///
-/// A miss is treated as "not a function object" at runtime. Debug builds panic
-/// when the missed identity exists in the full ABI so tests cannot silently
-/// lower a lambda as a constructor call.
+/// A miss is treated as "not a function object" at runtime. `identities` is the
+/// expected FO set for this crop (CU types ∩ ABI FOs, plus local catalog keys),
+/// not every function object in the archive. Debug builds panic when a miss is
+/// in that expected set so tests cannot silently drop a resolved lambda.
+/// Release builds compile the assertion out and still return `None`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SourceObjectTypes {
     types: BTreeMap<ArgType, JavaType>,
@@ -33,6 +35,18 @@ impl SourceObjectTypes {
         identities: Arc<BTreeSet<ArgType>>,
     ) -> Self {
         Self { types, identities }
+    }
+
+    pub(crate) fn checked(
+        types: BTreeMap<ArgType, JavaType>,
+        identities: Arc<BTreeSet<ArgType>>,
+    ) -> Self {
+        debug_assert!(
+            identities.iter().all(|ty| types.contains_key(ty)),
+            "source_object_types omitted expected function object {:?}",
+            identities.iter().find(|ty| !types.contains_key(*ty))
+        );
+        Self::new(types, identities)
     }
 
     pub(crate) fn get(&self, ty: &ArgType) -> Option<&JavaType> {
@@ -6791,5 +6805,14 @@ mod tests {
         );
         assert_eq!(types.get(&identity), Some(&interface));
         assert!(types.contains_key(&identity));
+    }
+
+    #[test]
+    fn source_object_types_miss_outside_expected_identities_is_non_fo() {
+        let types = SourceObjectTypes::new(
+            BTreeMap::new(),
+            Arc::new(BTreeSet::from([ArgType::object("example/Fn")])),
+        );
+        assert!(!types.contains_key(&ArgType::object("example/OtherFn")));
     }
 }

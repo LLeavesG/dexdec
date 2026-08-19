@@ -351,6 +351,10 @@ impl JavaMethodBody {
         self.type_uses.iter()
     }
 
+    pub(in crate::analysis::java_backend) fn current_type(&self) -> Option<&ArgType> {
+        self.current_type.as_ref()
+    }
+
     pub fn is_empty(body: &crate::language::java::JavaMethodBody) -> bool {
         match &body.root {
             crate::language::java::JavaStmt::Empty => true,

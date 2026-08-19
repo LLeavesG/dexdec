@@ -25,11 +25,12 @@ impl JavaDecompiler {
     /// 4. Construct semantic IR from SCC and reaching-condition facts
     /// 5. Recover values and lower the Java AST
     pub fn generate_method(&mut self, cfg: &mut CFG) -> Result<String, JavaDecompilerError> {
+        let current_type = cfg.method().owner().clone();
         let method = self.build_method_model(cfg)?;
         let declaration = JavaSingleMethodLowering::lower(
             &method,
             None,
-            None,
+            Some(&current_type),
             method_type_uses(&method),
             &self.source_abi,
             self.type_hierarchy.clone(),
@@ -449,7 +450,8 @@ impl JavaDecompiler {
 
     fn build_method_model(&self, cfg: &mut CFG) -> Result<JavaMethodModel, JavaDecompilerError> {
         let declaration = JavaMethodDeclaration::from_cfg(cfg);
-        let options = declaration.body_options(None);
+        let mut options = declaration.body_options(None);
+        options.current_type = Some(cfg.method().owner().clone());
         let body = MethodBodyPipeline::new(self.type_hierarchy.as_ref(), self.observer.as_ref())
             .analyze(cfg)?;
         method_model_from_body_analysis(declaration, body, options)

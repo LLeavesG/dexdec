@@ -418,3 +418,187 @@ impl MethodTypeUses<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::DecompilerContext;
+    use crate::ir::analysis::ClassHierarchyIndex;
+    use crate::ir::{
+        Block, InsnArg, InsnNode, MethodContext, MethodDescriptor, RegionKind, RegisterArg, CFG,
+    };
+    use crate::JavaDecompiler;
+    use std::path::{Path, PathBuf};
+
+    fn trivial_int_cfg() -> CFG {
+        let method = MethodContext::new(
+            ArgType::object("java/lang/Object"),
+            "answer",
+            MethodDescriptor {
+                parameters: Vec::new(),
+                return_type: ArgType::INT,
+            },
+            true,
+        );
+        let mut cfg = CFG::with_method(method);
+        cfg.registers = 1;
+        let dest = RegisterArg::new_ssa(0, 0, ArgType::INT);
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::const_val(dest.clone(), 1, ArgType::INT));
+        block.push(InsnNode::return_value(InsnArg::Reg(dest)));
+        cfg.add_block(block);
+        cfg
+    }
+
+    fn print_method(cfg: &mut CFG) -> String {
+        JavaDecompiler::new(Default::default())
+            .generate_method(cfg)
+            .expect("printed method declaration")
+    }
+
+    fn assert_shortcut_side_is_active() {
+        assert!(
+            crate::ir::trivial_early_returns(),
+            "DEXDEC_TRIVIAL_CROSSCHECK / DEXDEC_TRIVIAL_FASTPATH=0 must stay unset so this compares shortcut vs full"
+        );
+    }
+
+    fn assert_printed_text_matches_full_passes(cfg: &CFG, label: &str) {
+        assert_shortcut_side_is_active();
+        let mut early = cfg.clone();
+        let mut full = cfg.clone();
+        let early_text = print_method(&mut early);
+        let full_text = crate::ir::disable_trivial_early_returns(|| print_method(&mut full));
+        assert_eq!(early_text, full_text, "{label}");
+    }
+
+    fn crate_path(relative: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    fn compare_straight_line_methods(
+        path: &Path,
+        class_pred: impl Fn(&str) -> bool,
+        class_limit: usize,
+        method_limit: usize,
+    ) -> usize {
+        let mut ctx = DecompilerContext::from_file(path)
+            .unwrap_or_else(|error| panic!("load {}: {error}", path.display()));
+        let classes = ctx
+            .class_names()
+            .into_iter()
+            .filter(|name| class_pred(name))
+            .take(class_limit)
+            .collect::<Vec<_>>();
+        assert!(
+            !classes.is_empty(),
+            "no matching classes in {}",
+            path.display()
+        );
+        ctx.load_classes(classes.iter().map(String::as_str))
+            .expect("load classes");
+        let hierarchy = ClassHierarchyIndex::default();
+        let mut compared = 0usize;
+        for class_name in &classes {
+            let methods = ctx
+                .get_class(class_name)
+                .expect("loaded class")
+                .methods()
+                .iter()
+                .filter(|method| method.code().is_some())
+                .map(|method| (method.name().to_string(), method.info.descriptor()))
+                .collect::<Vec<_>>();
+            for (name, descriptor) in methods {
+                if compared >= method_limit {
+                    return compared;
+                }
+                let Some(decoded) = ctx
+                    .decode_method(class_name, &name, Some(&descriptor))
+                    .ok()
+                    .flatten()
+                    .cloned()
+                else {
+                    continue;
+                };
+                let mut analyzed = decoded.clone();
+                let Ok(analysis) = CfgPipeline::new(&hierarchy).analyze(&mut analyzed) else {
+                    continue;
+                };
+                if !crate::ir::is_straight_line(&analyzed, &analysis.values) {
+                    continue;
+                }
+                assert_printed_text_matches_full_passes(
+                    &decoded,
+                    &format!("{class_name}->{name}{descriptor}"),
+                );
+                compared += 1;
+            }
+        }
+        compared
+    }
+
+    #[test]
+    fn straight_line_printed_text_matches_full_passes() {
+        assert_printed_text_matches_full_passes(&trivial_int_cfg(), "synthetic answer");
+        let printed = print_method(&mut trivial_int_cfg());
+        assert!(printed.contains("static int answer()"), "{printed}");
+        assert!(printed.contains("return 1"), "{printed}");
+    }
+
+    #[test]
+    fn straight_line_printed_text_matches_full_passes_on_dex_fixtures() {
+        let fixtures = compare_straight_line_methods(
+            &crate_path("tests/testcases/classes.dex"),
+            |name| name.contains("HelloWorld"),
+            4,
+            8,
+        );
+        let multidex = compare_straight_line_methods(
+            &crate_path("../rusty-dex/tests/multidex.apk"),
+            |name| name.contains("manymethods"),
+            1,
+            12,
+        );
+        assert!(
+            fixtures + multidex > 0,
+            "expected at least one straight-line method in HelloWorld or manymethods"
+        );
+    }
+
+    #[test]
+    fn java_value_fixed_point_apply_has_no_iteration_cap() {
+        let source = include_str!("method_pipeline.rs");
+        let apply = source
+            .split("impl<'a, 'hierarchy> JavaValueFixedPoint")
+            .nth(1)
+            .and_then(|rest| rest.split("fn apply(").nth(1))
+            .and_then(|rest| rest.split("fn method_stats_enabled").next())
+            .expect("JavaValueFixedPoint::apply");
+        assert!(apply.contains("loop {"), "{apply}");
+        assert!(!apply.contains("iterations >"), "{apply}");
+        assert!(!apply.contains("MAX_"), "{apply}");
+    }
+
+    #[test]
+    fn straight_line_pipeline_still_builds_a_method_root() {
+        let mut cfg = trivial_int_cfg();
+        let hierarchy = ClassHierarchyIndex::default();
+        let values = CfgPipeline::new(&hierarchy)
+            .analyze(&mut cfg)
+            .expect("cfg/ssa")
+            .values;
+        assert!(crate::ir::is_straight_line(&cfg, &values));
+        let analysis = ExceptionAnalyzer::new(&cfg, &values, &hierarchy)
+            .analyze()
+            .expect("empty exception analysis");
+        let graph = RegionGraphBuilder::new(&cfg, &analysis, &values)
+            .build()
+            .expect("region graph");
+        let root = graph
+            .tree()
+            .region(graph.tree().root())
+            .expect("method root");
+        assert!(matches!(root.kind, RegionKind::Method));
+        assert_eq!(root.blocks.len(), cfg.blocks.len());
+    }
+}

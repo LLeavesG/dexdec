@@ -3,10 +3,19 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
-use crate::analysis::{JavaDecompilerConfig, KotlinDecompilerConfig};
+use rayon::prelude::*;
+
+use super::ClassRenderInput;
+use crate::analysis::java_backend::JavaSourceAbi;
+use crate::analysis::kotlin_backend::KotlinSourceAbi;
+use crate::analysis::{
+    JavaDecompiler, JavaDecompilerConfig, KotlinDecompiler, KotlinDecompilerConfig,
+};
 use crate::frontend::kotlin_metadata::KotlinMetadata;
 use crate::frontend::DexFileReader;
+use crate::ir::analysis::ClassHierarchyIndex;
 use crate::ir::{AnalysisObserver, NullAnalysisObserver};
 use crate::language::java::JavaIdentifier;
 use crate::language::kotlin::KotlinIdentifier;
@@ -32,6 +41,10 @@ pub struct DecompileOptions {
     pub java: JavaDecompilerConfig,
     pub kotlin: KotlinDecompilerConfig,
     pub include_nested: bool,
+    /// When true (default), each class request discards the loaded class graph
+    /// so one interactive lookup cannot leak into the next. Full-archive
+    /// decompilation should set this to false and keep shared analysis.
+    pub isolate_requests: bool,
 }
 
 impl DecompileOptions {
@@ -54,6 +67,11 @@ impl DecompileOptions {
         self.include_nested = include_nested;
         self
     }
+
+    pub fn with_isolated_requests(mut self, isolate_requests: bool) -> Self {
+        self.isolate_requests = isolate_requests;
+        self
+    }
 }
 
 impl Default for DecompileOptions {
@@ -63,6 +81,7 @@ impl Default for DecompileOptions {
             java: JavaDecompilerConfig::default(),
             kotlin: KotlinDecompilerConfig::default(),
             include_nested: true,
+            isolate_requests: true,
         }
     }
 }
@@ -454,6 +473,169 @@ impl Decompiler {
         })
     }
 
+    /// Generate many classes while reusing the loaded archive graph.
+    ///
+    /// This is the full-archive path: shared hierarchy/ABI, one decode pass,
+    /// one termination solve, then class generation in parallel.
+    pub fn generate_classes(
+        &mut self,
+        classes: Vec<(String, SourceLanguage)>,
+    ) -> Result<Vec<Result<SourceUnit, ClassFailure>>, DecompileError> {
+        if classes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.options.isolate_requests || classes.len() == 1 {
+            return Ok(classes
+                .into_iter()
+                .map(|(class, language)| {
+                    self.set_options(self.options.clone().with_language(language));
+                    let class_name = class.clone();
+                    let method_count = self
+                        .context
+                        .get_class(&class)
+                        .map_or(0, |node| node.methods().len());
+                    self.class(class).map_err(|error| ClassFailure {
+                        class: class_name,
+                        method_count,
+                        error,
+                    })
+                })
+                .collect());
+        }
+
+        let needs_java = classes
+            .iter()
+            .any(|(_, language)| *language == SourceLanguage::Java);
+        let needs_kotlin = classes
+            .iter()
+            .any(|(_, language)| *language == SourceLanguage::Kotlin);
+        let stats = batch_stats_enabled();
+        let t0 = Instant::now();
+        self.context.prepare_archive_overrides()?;
+        let overrides_ms = t0.elapsed();
+        let t1 = Instant::now();
+        self.context.prefetch_decoded_methods()?;
+        let prefetch_ms = t1.elapsed();
+        let t2 = Instant::now();
+        self.context
+            .prepare_archive_source_abi(needs_java, needs_kotlin)?;
+        let abi_ms = t2.elapsed();
+        let t3 = Instant::now();
+        self.context.apply_archive_termination()?;
+        let termination_ms = t3.elapsed();
+
+        let include_nested = self.options.include_nested;
+        let observer = Arc::clone(&self.observer);
+        let t4 = Instant::now();
+        let mut ready = Vec::new();
+        let mut finished: Vec<Option<Result<SourceUnit, ClassFailure>>> =
+            (0..classes.len()).map(|_| None).collect();
+        for (index, (class, language)) in classes.into_iter().enumerate() {
+            let method_count = self
+                .context
+                .get_class(&class)
+                .map_or(0, |node| node.methods().len());
+            match self.context.collect_class_render_input(
+                &class,
+                include_nested,
+                Arc::clone(&observer),
+                false,
+            ) {
+                Ok(Some(input)) => ready.push((
+                    index,
+                    ArchiveClassJob {
+                        class,
+                        language,
+                        method_count,
+                        input,
+                    },
+                )),
+                Ok(None) => {
+                    finished[index] = Some(Err(ClassFailure {
+                        class: class.clone(),
+                        method_count,
+                        error: DecompileError::ClassNotFound(class),
+                    }));
+                }
+                Err(error) => {
+                    finished[index] = Some(Err(ClassFailure {
+                        class,
+                        method_count,
+                        error,
+                    }));
+                }
+            }
+        }
+
+        let collect_ms = t4.elapsed();
+        let hierarchy = self.context.type_hierarchy()?;
+        let java_abi = if needs_java {
+            self.context.java_source_abi()
+        } else {
+            Arc::new(JavaSourceAbi::default())
+        };
+        let kotlin_abi = if needs_kotlin {
+            self.context.kotlin_source_abi()?
+        } else {
+            Arc::new(KotlinSourceAbi::default())
+        };
+        self.context.abandon_archive_buffers();
+        let java = self.options.java.clone();
+        let kotlin = self.options.kotlin.clone();
+        let observer = Arc::clone(&self.observer);
+
+        let t5 = Instant::now();
+        let rendered = ready
+            .into_par_iter()
+            .map(|(index, job)| {
+                let started = Instant::now();
+                let class = job.class.clone();
+                let result = render_archive_job(
+                    job,
+                    &java,
+                    &kotlin,
+                    &hierarchy,
+                    &java_abi,
+                    &kotlin_abi,
+                    &observer,
+                );
+                (index, class, started.elapsed(), result)
+            })
+            .collect::<Vec<_>>();
+        let generate_ms = t5.elapsed();
+        if stats {
+            let mut slow = rendered
+                .iter()
+                .map(|(_, class, elapsed, _)| (elapsed.as_secs_f64() * 1000.0, class.as_str()))
+                .collect::<Vec<_>>();
+            slow.sort_by(|left, right| right.0.total_cmp(&left.0));
+            let top = slow
+                .into_iter()
+                .take(8)
+                .map(|(ms, class)| format!("{class}={ms:.0}ms"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "dexdec batch: overrides={:.0}ms prefetch={:.0}ms abi={:.0}ms termination={:.0}ms collect={:.0}ms generate={:.0}ms classes={} slowest[{}]",
+                overrides_ms.as_secs_f64() * 1000.0,
+                prefetch_ms.as_secs_f64() * 1000.0,
+                abi_ms.as_secs_f64() * 1000.0,
+                termination_ms.as_secs_f64() * 1000.0,
+                collect_ms.as_secs_f64() * 1000.0,
+                generate_ms.as_secs_f64() * 1000.0,
+                finished.len(),
+                top,
+            );
+        }
+        for (index, _, _, result) in rendered {
+            finished[index] = Some(result);
+        }
+        Ok(finished
+            .into_iter()
+            .map(|result| result.expect("every archive class slot is filled"))
+            .collect())
+    }
+
     fn generate_class(&mut self, class: String) -> Result<SourceUnit, DecompileError> {
         let method_count = self
             .context
@@ -475,7 +657,9 @@ impl Decompiler {
                 Arc::clone(&self.observer),
             ),
         };
-        self.context.clear_method_cache();
+        if self.options.isolate_requests {
+            self.context.clear_method_cache();
+        }
         let source = generated?.ok_or_else(|| DecompileError::ClassNotFound(class.clone()))?;
         Ok(SourceUnit {
             path: source_path(&class, self.options.language),
@@ -571,6 +755,77 @@ pub fn source_path(descriptor: &str, language: SourceLanguage) -> PathBuf {
     path
 }
 
+fn batch_stats_enabled() -> bool {
+    std::env::var_os("DEXDEC_BATCH_STATS").is_some()
+}
+
+struct ArchiveClassJob {
+    class: String,
+    language: SourceLanguage,
+    method_count: usize,
+    input: ClassRenderInput,
+}
+
+fn archive_java_parallel_methods() -> bool {
+    // A/B only: class-parallel archive jobs serialize method bodies by default.
+    std::env::var_os("DEXDEC_ARCHIVE_METHOD_PARALLEL").is_some_and(|value| value == "1")
+}
+
+fn render_archive_job(
+    mut job: ArchiveClassJob,
+    java: &JavaDecompilerConfig,
+    kotlin: &KotlinDecompilerConfig,
+    hierarchy: &Arc<ClassHierarchyIndex>,
+    java_abi: &Arc<JavaSourceAbi>,
+    kotlin_abi: &Arc<KotlinSourceAbi>,
+    observer: &Arc<dyn AnalysisObserver>,
+) -> Result<SourceUnit, ClassFailure> {
+    let generated = match job.language {
+        SourceLanguage::Java => {
+            let mut decompiler = JavaDecompiler::new(java.clone())
+                .with_shared_type_hierarchy(Arc::clone(hierarchy))
+                .with_source_abi(Arc::clone(java_abi))
+                .with_analysis_observer(Arc::clone(observer))
+                .with_parallel_methods(archive_java_parallel_methods());
+            debug_assert!(
+                !decompiler.parallel_methods() || archive_java_parallel_methods(),
+                "archive Java jobs set parallel_methods=false unless DEXDEC_ARCHIVE_METHOD_PARALLEL=1"
+            );
+            decompiler
+                .generate_class_with_nested(
+                    &job.input.class_node,
+                    &mut job.input.methods,
+                    job.input.nested,
+                )
+                .map_err(DecompileError::from)
+        }
+        SourceLanguage::Kotlin => KotlinDecompiler::new(kotlin.clone())
+            .with_shared_type_hierarchy(Arc::clone(hierarchy))
+            .with_source_abi(Arc::clone(kotlin_abi))
+            .with_analysis_observer(Arc::clone(observer))
+            .generate_class_with_nested(
+                &job.input.class_node,
+                &mut job.input.methods,
+                job.input.nested,
+            )
+            .map_err(DecompileError::from),
+    };
+    match generated {
+        Ok(source) => Ok(SourceUnit {
+            path: source_path(&job.class, job.language),
+            class: job.class,
+            language: job.language,
+            method_count: job.method_count,
+            source,
+        }),
+        Err(error) => Err(ClassFailure {
+            class: job.class,
+            method_count: job.method_count,
+            error,
+        }),
+    }
+}
+
 /// Relative Java source path derived from a DEX class descriptor.
 pub fn java_source_path(descriptor: &str) -> PathBuf {
     source_path(descriptor, SourceLanguage::Java)
@@ -616,6 +871,23 @@ mod tests {
             ClassSelector::listed(["LB;", "LA;", "LB;"]),
             ClassSelector::Listed(BTreeSet::from(["LA;".to_string(), "LB;".to_string()]))
         );
+    }
+
+    #[test]
+    fn archive_java_jobs_disable_method_parallelism() {
+        assert!(
+            !archive_java_parallel_methods(),
+            "archive jobs must serialize Java method bodies by default"
+        );
+        let decompiler = JavaDecompiler::new(JavaDecompilerConfig::default())
+            .with_parallel_methods(archive_java_parallel_methods());
+        assert!(!decompiler.parallel_methods());
+    }
+
+    #[test]
+    fn isolate_java_decompiler_enables_method_parallelism() {
+        let decompiler = JavaDecompiler::new(JavaDecompilerConfig::default());
+        assert!(decompiler.parallel_methods());
     }
 
     #[test]

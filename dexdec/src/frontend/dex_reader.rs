@@ -853,6 +853,15 @@ impl DexFileReader {
         self.mark_override_analysis_dirty();
     }
 
+    /// Drop loaded class nodes without running their destructors.
+    ///
+    /// Full-archive decompilation clones what it still needs into render jobs.
+    /// Destroying the leftover graph at process shutdown is pure overhead.
+    pub(crate) fn abandon_loaded_classes(&mut self) {
+        let classes = std::mem::take(&mut self.classes);
+        std::mem::forget(classes);
+    }
+
     /// Get the index of the DEX file containing the class
     pub fn get_dex_index(&self, class_name: &str) -> Option<usize> {
         self.class_locations

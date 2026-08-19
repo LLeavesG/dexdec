@@ -479,16 +479,17 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
     }
 
     fn erasure_of(&self, ty: &JavaType) -> Option<ArgType> {
-        self.cache
+        let hit = self
+            .cache
             .resolved
             .borrow()
             .iter()
-            .find_map(|(erased, source)| (source == ty).then(|| erased.clone()))
-            .or_else(|| {
-                self.names
-                    .source_signature(ty)
-                    .map(|signature| signature.erased())
-            })
+            .find_map(|(erased, source)| (source == ty).then(|| erased.clone()));
+        hit.or_else(|| {
+            self.names
+                .source_signature(ty)
+                .map(|signature| signature.erased())
+        })
     }
 
     fn declared_type_parameters(

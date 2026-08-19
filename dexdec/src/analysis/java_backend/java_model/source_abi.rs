@@ -601,6 +601,8 @@ pub(crate) struct JavaSourceAbi {
     inherited_member_types: BTreeMap<ArgType, BTreeSet<(JavaIdentifier, ArgType)>>,
     outer_instances: std::collections::BTreeMap<FieldReference, ArgType>,
     field_types: std::collections::BTreeMap<FieldReference, GenericFieldContract>,
+    generic_field_declarations:
+        std::collections::BTreeMap<(String, ArgType), Vec<(ArgType, GenericFieldContract)>>,
     method_exceptions: std::collections::BTreeMap<MethodReference, Vec<ArgType>>,
     platform_exceptions: std::sync::Arc<std::collections::BTreeMap<MethodReference, Vec<ArgType>>>,
     generic_methods: std::collections::BTreeMap<MethodReference, GenericMethodContract>,
@@ -668,7 +670,7 @@ impl JavaSourceAbi {
                     ))
                 })
             })
-            .collect();
+            .collect::<std::collections::BTreeMap<_, _>>();
         let method_exceptions = classes
             .iter()
             .copied()
@@ -812,6 +814,16 @@ impl JavaSourceAbi {
                 .or_insert_with(Vec::new)
                 .push((method.owner.clone(), contract.clone()));
         }
+        let mut generic_field_declarations: std::collections::BTreeMap<
+            (String, ArgType),
+            Vec<(ArgType, GenericFieldContract)>,
+        > = std::collections::BTreeMap::new();
+        for (field, contract) in &field_types {
+            generic_field_declarations
+                .entry((field.name.clone(), field.field_type.clone()))
+                .or_insert_with(Vec::new)
+                .push((field.owner.clone(), contract.clone()));
+        }
         let mut abi = Self {
             constructors,
             methods,
@@ -820,6 +832,7 @@ impl JavaSourceAbi {
             inherited_member_types,
             outer_instances,
             field_types,
+            generic_field_declarations,
             method_exceptions,
             platform_exceptions,
             generic_methods,
@@ -1008,28 +1021,34 @@ impl JavaSourceAbi {
         if let Some(contract) = self.field_types.get(field) {
             return Some(contract.clone());
         }
+        self.inherited_generic_field(field)
+    }
+
+    fn inherited_generic_field(&self, field: &FieldReference) -> Option<GenericFieldContract> {
         let hierarchy = self.generic_hierarchy.as_ref()?;
-        let mut nearest: Option<(&FieldReference, &GenericFieldContract)> = None;
-        for (candidate, contract) in self.field_types.iter().filter(|(candidate, _)| {
-            candidate.name == field.name
-                && candidate.field_type == field.field_type
-                && hierarchy.is_subtype(&field.owner, &candidate.owner)
-        }) {
+        let candidates = self
+            .generic_field_declarations
+            .get(&(field.name.clone(), field.field_type.clone()))?;
+        let mut nearest: Option<(&ArgType, &GenericFieldContract)> = None;
+        for (candidate_owner, contract) in candidates
+            .iter()
+            .filter(|(owner, _)| hierarchy.is_subtype(&field.owner, owner))
+        {
             nearest = match nearest {
-                None => Some((candidate, contract)),
-                Some((current, _)) if hierarchy.is_subtype(&candidate.owner, &current.owner) => {
-                    Some((candidate, contract))
+                None => Some((candidate_owner, contract)),
+                Some((current, _)) if hierarchy.is_subtype(candidate_owner, current) => {
+                    Some((candidate_owner, contract))
                 }
                 Some((current, current_contract))
-                    if hierarchy.is_subtype(&current.owner, &candidate.owner) =>
+                    if hierarchy.is_subtype(current, candidate_owner) =>
                 {
                     Some((current, current_contract))
                 }
                 Some(_) => return None,
             };
         }
-        let (declaring_field, contract) = nearest?;
-        if declaring_field.owner == field.owner {
+        let (declaring_owner, contract) = nearest?;
+        if declaring_owner == &field.owner {
             return Some(contract.clone());
         }
         let Some(instantiated_owner) = self.owner_types.get(&field.owner) else {

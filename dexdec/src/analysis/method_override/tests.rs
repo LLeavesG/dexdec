@@ -105,6 +105,30 @@ fn resolves_declared_platform_generic_method_contract() {
 }
 
 #[test]
+fn method_overloads_index_matches_btree_set_order() {
+    let hierarchy =
+        GenericTypeHierarchy::from_classes(std::iter::empty::<&ClassNode>()).expect("hierarchy");
+    let method = "Ljava/lang/String;->valueOf(Ljava/lang/Object;)Ljava/lang/String;"
+        .parse::<crate::ir::MethodReference>()
+        .expect("method reference");
+    let overloads = hierarchy.method_overloads(&method);
+    assert!(
+        overloads.len() > 1,
+        "String.valueOf should have multiple arity-1 overloads, got {overloads:?}"
+    );
+    assert!(
+        overloads.windows(2).all(|pair| pair[0] <= pair[1]),
+        "overload order must match BTreeSet iteration: {overloads:?}"
+    );
+    assert!(overloads.iter().all(|candidate| {
+        candidate.owner == method.owner
+            && candidate.name == method.name
+            && candidate.descriptor.parameters.len() == method.descriptor.parameters.len()
+    }));
+    assert_eq!(overloads, hierarchy.method_overloads(&method));
+}
+
+#[test]
 fn infers_parameterized_platform_subtype_from_target_type() {
     let hierarchy =
         GenericTypeHierarchy::from_classes(std::iter::empty::<&ClassNode>()).expect("hierarchy");

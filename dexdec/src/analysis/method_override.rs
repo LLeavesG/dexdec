@@ -675,9 +675,22 @@ impl LoadedClassHierarchy {
     }
 }
 
+type MethodOverloadKey = (String, usize);
+type MethodOverloadSet = BTreeSet<crate::ir::MethodReference>;
+type MethodOverloadsByKey = BTreeMap<MethodOverloadKey, MethodOverloadSet>;
+
+/// Owner → (name, arity) → overloads declared on that owner or a parent.
+/// Values remap `MethodReference.owner` to the query owner so iteration order
+/// matches the previous `BTreeSet` walk.
+#[derive(Debug, Default)]
+struct MethodOverloadIndex {
+    by_owner: RwLock<BTreeMap<ArgType, MethodOverloadsByKey>>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct GenericTypeHierarchy {
     hierarchy: CompositeClassHierarchy,
+    method_overloads: Arc<MethodOverloadIndex>,
 }
 
 impl GenericTypeHierarchy {
@@ -685,9 +698,19 @@ impl GenericTypeHierarchy {
         classes: impl IntoIterator<Item = &'a ClassNode>,
     ) -> OverrideResult<Self> {
         let (loaded, _) = LoadedClassHierarchy::decode_classes(classes)?;
-        Ok(Self {
+        let owners = loaded
+            .classes
+            .keys()
+            .filter_map(|descriptor| descriptor.parse().ok())
+            .collect::<Vec<_>>();
+        let hierarchy = Self {
             hierarchy: CompositeClassHierarchy::from_loaded(loaded)?,
-        })
+            method_overloads: Arc::new(MethodOverloadIndex::default()),
+        };
+        for owner in owners {
+            hierarchy.ensure_method_overloads(&owner);
+        }
+        Ok(hierarchy)
     }
 
     pub(crate) fn inherited_method_signature(
@@ -828,35 +851,70 @@ impl GenericTypeHierarchy {
         &self,
         method: &crate::ir::MethodReference,
     ) -> Vec<crate::ir::MethodReference> {
-        let mut overloads = BTreeSet::new();
-        let mut pending = vec![method.owner.clone()];
+        self.ensure_method_overloads(&method.owner);
+        let key = (method.name.clone(), method.descriptor.parameters.len());
+        let Ok(index) = self.method_overloads.by_owner.read() else {
+            return self
+                .collect_owner_overloads(&method.owner)
+                .remove(&key)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+        };
+        index
+            .get(&method.owner)
+            .and_then(|overloads| overloads.get(&key))
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+
+    fn ensure_method_overloads(&self, owner: &ArgType) {
+        if self
+            .method_overloads
+            .by_owner
+            .read()
+            .map(|index| index.contains_key(owner))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let grouped = self.collect_owner_overloads(owner);
+        if let Ok(mut index) = self.method_overloads.by_owner.write() {
+            index.entry(owner.clone()).or_insert(grouped);
+        }
+    }
+
+    fn collect_owner_overloads(&self, owner: &ArgType) -> MethodOverloadsByKey {
+        let mut overloads = MethodOverloadsByKey::new();
+        let mut pending = vec![owner.clone()];
         let mut visited = BTreeSet::new();
-        while let Some(owner) = pending.pop() {
-            if !visited.insert(owner.clone()) {
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current.clone()) {
                 continue;
             }
-            let Some(declared) = self.hierarchy.class_details(&owner) else {
+            let Some(declared) = self.hierarchy.class_details(&current) else {
                 continue;
             };
-            overloads.extend(
-                declared
-                    .methods
-                    .iter()
-                    .filter_map(|candidate| Self::ir_method_reference(&candidate.reference))
-                    .filter(|candidate| {
-                        candidate.name == method.name
-                            && candidate.descriptor.parameters.len()
-                                == method.descriptor.parameters.len()
-                    })
-                    .map(|candidate| crate::ir::MethodReference {
-                        owner: method.owner.clone(),
+            for candidate in declared
+                .methods
+                .iter()
+                .filter_map(|candidate| Self::ir_method_reference(&candidate.reference))
+            {
+                let arity = candidate.descriptor.parameters.len();
+                overloads
+                    .entry((candidate.name.clone(), arity))
+                    .or_default()
+                    .insert(crate::ir::MethodReference {
+                        owner: owner.clone(),
                         name: candidate.name,
                         descriptor: candidate.descriptor,
-                    }),
-            );
+                    });
+            }
             pending.extend(declared.parents);
         }
-        overloads.into_iter().collect()
+        overloads
     }
 
     pub(crate) fn method_contract(

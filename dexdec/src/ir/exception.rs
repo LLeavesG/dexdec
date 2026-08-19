@@ -5,8 +5,52 @@
 //! intervals, handler ownership comes from normal-flow reachability, and a
 //! catch-all handler is classified by an all-path exceptional-value analysis.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+
+thread_local! {
+    static DISABLE_TRIVIAL_EARLY_RETURNS: Cell<bool> = Cell::new(false);
+}
+
+/// Candidate for skip-only shortcuts. Not a license to drop SSA, source
+/// allocation, Structural `prepare_source`, or Full source recovery.
+pub(crate) fn is_straight_line(cfg: &CFG, values: &SsaValueGraph) -> bool {
+    cfg.blocks.len() == 1
+        && cfg.handlers.is_empty()
+        && values.phis().is_empty()
+        && cfg.blocks.values().all(|block| {
+            block.insns.iter().all(|insn| {
+                !matches!(
+                    insn.insn_type,
+                    InsnType::If | InsnType::Switch | InsnType::Goto
+                )
+            })
+        })
+}
+
+/// Skip-only shortcuts stay on unless tests or `DEXDEC_TRIVIAL_CROSSCHECK` ask
+/// for the full algorithms so printed method text can be compared.
+pub(crate) fn trivial_early_returns() -> bool {
+    if DISABLE_TRIVIAL_EARLY_RETURNS.with(Cell::get) {
+        return false;
+    }
+    std::env::var_os("DEXDEC_TRIVIAL_CROSSCHECK").is_none()
+}
+
+pub(crate) fn disable_trivial_early_returns<T>(f: impl FnOnce() -> T) -> T {
+    DISABLE_TRIVIAL_EARLY_RETURNS.with(|flag| {
+        let previous = flag.replace(true);
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                DISABLE_TRIVIAL_EARLY_RETURNS.with(|flag| flag.set(self.0));
+            }
+        }
+        let _reset = Reset(previous);
+        f()
+    })
+}
 
 #[path = "exception/cleanup.rs"]
 mod cleanup;
@@ -440,6 +484,9 @@ impl<'a> ExceptionAnalyzer<'a> {
             if !self.handler_entries.contains_key(&clause.handler) {
                 return Err(ExceptionInvariantError::MissingHandlerEntry(clause.handler));
             }
+        }
+        if is_straight_line(self.cfg, self.values) && trivial_early_returns() {
+            return Ok(ExceptionAnalysis::default());
         }
         let scopes = HandlerStackForest::new(self).build(self.raw_regions())?;
         let ownership =
@@ -4338,8 +4385,60 @@ impl<'a> FiniteExitAnalysis<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::analysis::ClassHierarchyIndex;
-    use crate::ir::{Block, ExceptionHandler, InsnNode};
+    use crate::ir::analysis::{ClassHierarchyIndex, SsaValueGraph};
+    use crate::ir::{Block, ExceptionHandler, InsnNode, RegionGraphBuilder, RegionKind};
+
+    fn straight_line_cfg() -> CFG {
+        let mut cfg = CFG::new("trivial");
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::return_void());
+        cfg.add_block(block);
+        cfg.identify_instructions();
+        cfg.capture_exception_coverage();
+        cfg
+    }
+
+    #[test]
+    fn classifies_a_single_block_return_as_straight_line() {
+        let cfg = straight_line_cfg();
+        let values = SsaValueGraph::build(&cfg).expect("SSA values");
+        assert!(is_straight_line(&cfg, &values));
+    }
+
+    #[test]
+    fn rejects_goto_and_multi_block_methods_as_straight_line() {
+        let mut cfg = CFG::new("goto");
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::goto(0));
+        cfg.add_block(block);
+        assert!(!is_straight_line(&cfg, &SsaValueGraph::default()));
+
+        let mut cfg = CFG::new("two_blocks");
+        cfg.add_block(Block::new(0u32));
+        cfg.add_block(Block::new(1u32));
+        assert!(!is_straight_line(&cfg, &SsaValueGraph::default()));
+    }
+
+    #[test]
+    fn straight_line_empty_analysis_still_grows_a_method_root() {
+        let cfg = straight_line_cfg();
+        let values = SsaValueGraph::build(&cfg).expect("SSA values");
+        let hierarchy = exception_hierarchy();
+        let analysis = ExceptionAnalyzer::new(&cfg, &values, &hierarchy)
+            .analyze()
+            .expect("empty exception analysis");
+        assert!(analysis.regions.is_empty());
+        let graph = RegionGraphBuilder::new(&cfg, &analysis, &values)
+            .build()
+            .expect("region graph");
+        let root = graph
+            .tree()
+            .region(graph.tree().root())
+            .expect("method root");
+        assert!(matches!(root.kind, RegionKind::Method));
+        assert!(root.blocks.contains(&cfg.entry));
+        assert_eq!(root.blocks.len(), cfg.blocks.len());
+    }
 
     fn exception_hierarchy() -> ClassHierarchyIndex {
         let mut hierarchy = ClassHierarchyIndex::default();

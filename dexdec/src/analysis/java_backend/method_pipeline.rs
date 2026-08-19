@@ -418,3 +418,73 @@ impl MethodTypeUses<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::analysis::ClassHierarchyIndex;
+    use crate::ir::{
+        Block, InsnArg, InsnNode, MethodContext, MethodDescriptor, RegionKind, RegisterArg, CFG,
+    };
+    use crate::JavaDecompiler;
+
+    fn trivial_int_cfg() -> CFG {
+        let method = MethodContext::new(
+            ArgType::object("java/lang/Object"),
+            "answer",
+            MethodDescriptor {
+                parameters: Vec::new(),
+                return_type: ArgType::INT,
+            },
+            true,
+        );
+        let mut cfg = CFG::with_method(method);
+        cfg.registers = 1;
+        let dest = RegisterArg::new_ssa(0, 0, ArgType::INT);
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::const_val(dest.clone(), 1, ArgType::INT));
+        block.push(InsnNode::return_value(InsnArg::Reg(dest)));
+        cfg.add_block(block);
+        cfg
+    }
+
+    fn print_method(cfg: &mut CFG) -> String {
+        JavaDecompiler::new(Default::default())
+            .generate_method(cfg)
+            .expect("printed method declaration")
+    }
+
+    #[test]
+    fn straight_line_printed_text_matches_full_passes() {
+        let mut early = trivial_int_cfg();
+        let mut full = early.clone();
+        let early_text = print_method(&mut early);
+        let full_text = crate::ir::disable_trivial_early_returns(|| print_method(&mut full));
+        assert_eq!(early_text, full_text);
+        assert!(early_text.contains("static int answer()"), "{early_text}");
+        assert!(early_text.contains("return 1"), "{early_text}");
+    }
+
+    #[test]
+    fn straight_line_pipeline_still_builds_a_method_root() {
+        let mut cfg = trivial_int_cfg();
+        let hierarchy = ClassHierarchyIndex::default();
+        let values = CfgPipeline::new(&hierarchy)
+            .analyze(&mut cfg)
+            .expect("cfg/ssa")
+            .values;
+        assert!(crate::ir::is_straight_line(&cfg, &values));
+        let analysis = ExceptionAnalyzer::new(&cfg, &values, &hierarchy)
+            .analyze()
+            .expect("empty exception analysis");
+        let graph = RegionGraphBuilder::new(&cfg, &analysis, &values)
+            .build()
+            .expect("region graph");
+        let root = graph
+            .tree()
+            .region(graph.tree().root())
+            .expect("method root");
+        assert!(matches!(root.kind, RegionKind::Method));
+        assert_eq!(root.blocks.len(), cfg.blocks.len());
+    }
+}

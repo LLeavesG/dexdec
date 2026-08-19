@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use crate::ir::{
     SemanticExpressionFacts, SemanticFoldError, SemanticFolder, SemanticLoopKind, SemanticNode,
+    SemanticVisitor,
 };
 
 pub(super) struct LoopInvariantMotion {
@@ -12,6 +13,9 @@ pub(super) struct LoopInvariantMotion {
 
 impl LoopInvariantMotion {
     pub(super) fn apply(root: &mut SemanticNode) -> Result<bool, SemanticFoldError> {
+        if crate::ir::trivial_early_returns() && !contains_loop(root) {
+            return Ok(false);
+        }
         let before = crate::ir::semantic::SemanticCompletion::analyze(root);
         let body = std::mem::replace(root, SemanticNode::Empty);
         let mut motion = Self { changed: false };
@@ -101,5 +105,31 @@ impl SemanticFolder for LoopInvariantMotion {
         Ok(SemanticNode::sequence(
             hoisted.into_iter().chain(std::iter::once(loop_node)),
         ))
+    }
+}
+
+fn contains_loop(root: &SemanticNode) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl SemanticVisitor for Finder {
+        fn enter_node(&mut self, node: &SemanticNode) {
+            self.found |= matches!(node, SemanticNode::Loop { .. });
+        }
+    }
+    let mut finder = Finder { found: false };
+    finder.visit_node(root);
+    finder.found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_trees_without_loops() {
+        let mut root = SemanticNode::Empty;
+        assert!(!LoopInvariantMotion::apply(&mut root).unwrap());
+        assert!(matches!(root, SemanticNode::Empty));
     }
 }

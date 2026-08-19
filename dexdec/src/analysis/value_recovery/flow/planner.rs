@@ -22,6 +22,7 @@ use crate::ir::analysis::SsaVar;
 pub(super) struct ValuePlanner<'a> {
     facts: SparseValueFacts<'a>,
     mode: RecoveryMode,
+    has_predicate_uses: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,9 +88,15 @@ impl<'a> ValuePlanner<'a> {
         graph: &'a ValueFlowGraph<'a>,
         mode: RecoveryMode,
     ) -> Result<Self, ValueRecoveryError> {
+        let facts = SparseValueFacts::analyze(graph)?;
+        let has_predicate_uses = facts.uses().values().any(|uses| {
+            uses.iter()
+                .any(|usage| usage.context == UseContext::Predicate)
+        });
         Ok(Self {
-            facts: SparseValueFacts::analyze(graph)?,
+            facts,
             mode,
+            has_predicate_uses,
         })
     }
 
@@ -683,6 +690,11 @@ impl<'a> ValuePlanner<'a> {
             return Ok(Some(action));
         }
         let inline = match self.mode {
+            RecoveryMode::Structural
+                if !self.has_predicate_uses && crate::ir::trivial_early_returns() =>
+            {
+                false
+            }
             RecoveryMode::Structural => uses
                 .first()
                 .is_some_and(|usage| usage.context == UseContext::Predicate),

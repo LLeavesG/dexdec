@@ -663,6 +663,14 @@ impl Decompiler {
     }
 
     fn generate_class(&mut self, class: String) -> Result<SourceUnit, DecompileError> {
+        if self.options.isolate_requests {
+            self.clear_analysis_scope();
+        }
+        if self.context.get_class(&class).is_none()
+            && self.context.load_class_deferred(&class)?.is_none()
+        {
+            return Err(DecompileError::ClassNotFound(class));
+        }
         let method_count = self
             .context
             .get_class(&class)
@@ -683,10 +691,10 @@ impl Decompiler {
                 Arc::clone(&self.observer),
             ),
         };
-        if self.options.isolate_requests {
-            self.context.clear_method_cache();
-        }
         let source = generated?.ok_or_else(|| DecompileError::ClassNotFound(class.clone()))?;
+        if self.options.isolate_requests {
+            self.clear_analysis_scope();
+        }
         Ok(SourceUnit {
             path: source_path(&class, self.options.language),
             class,
@@ -723,17 +731,23 @@ impl Iterator for ClassBatch<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let class = self.classes.next()?;
-        let method_count = self
-            .decompiler
-            .context
-            .get_class(&class)
-            .map_or(0, |node| node.methods().len());
         self.summary.classes += 1;
-        self.summary.methods += method_count;
         Some(match self.decompiler.generate_class(class.clone()) {
-            Ok(source) => Ok(source),
+            Ok(source) => {
+                self.summary.methods += source.method_count;
+                Ok(source)
+            }
             Err(error) => {
-                self.decompiler.context.clear_method_cache();
+                let method_count = self
+                    .decompiler
+                    .context
+                    .get_class(&class)
+                    .map_or(0, |node| node.methods().len());
+                if self.decompiler.options().isolate_requests {
+                    self.decompiler.clear_analysis_scope();
+                } else {
+                    self.decompiler.context.clear_method_cache();
+                }
                 self.summary.failures += 1;
                 self.summary.failed_methods += method_count;
                 Err(ClassFailure {
@@ -942,6 +956,25 @@ mod tests {
         for result in again {
             result.expect("abandoned buffers must not poison a later archive pass");
         }
+    }
+
+    #[test]
+    fn isolate_class_requests_discard_loaded_graph() {
+        let dex = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/testcases/classes.dex");
+        let mut decompiler = Decompiler::open(dex).expect("open test DEX");
+        decompiler.set_options(DecompileOptions::default().with_language(SourceLanguage::Java));
+        decompiler
+            .class("LHelloWorld;")
+            .expect("first isolate class");
+        assert!(
+            decompiler.reader().get_class("LHelloWorld;").is_none(),
+            "isolate class requests must discard the loaded class graph"
+        );
+        decompiler
+            .class("LSimpleIf;")
+            .expect("second isolate class after scope clear");
+        assert!(decompiler.reader().get_class("LHelloWorld;").is_none());
+        assert!(decompiler.reader().get_class("LSimpleIf;").is_none());
     }
 
     #[test]

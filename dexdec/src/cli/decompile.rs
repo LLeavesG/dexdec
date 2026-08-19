@@ -223,6 +223,7 @@ impl DecompileCommand {
     ) -> Vec<Result<SourceUnit, ClassFailure>> {
         let mut generated = Vec::with_capacity(jobs.len());
         for (class, language) in jobs {
+            decompiler.clear_analysis_scope();
             decompiler.set_options(decompiler.options().clone().with_language(language));
             let method_count = decompiler
                 .reader()

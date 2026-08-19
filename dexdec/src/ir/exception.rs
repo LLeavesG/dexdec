@@ -29,13 +29,34 @@ pub(crate) fn is_straight_line(cfg: &CFG, values: &SsaValueGraph) -> bool {
         })
 }
 
-/// Skip-only shortcuts stay on unless tests or `DEXDEC_TRIVIAL_CROSSCHECK` ask
-/// for the full algorithms so printed method text can be compared.
+/// Skip-only shortcuts stay on unless a kill switch or printed-text
+/// crosscheck asks for the full algorithms.
+///
+/// CLI never sets these. Unset is the default (shortcuts on).
+/// - `DEXDEC_TRIVIAL_FASTPATH=0` (also `false`/`off`/`no`) disables shortcuts.
+/// - `DEXDEC_TRIVIAL_CROSSCHECK` presence disables shortcuts so a dual-run
+///   can compare printed method text against the unskipped algorithms.
+///   Any value counts, including `=0`.
 pub(crate) fn trivial_early_returns() -> bool {
     if DISABLE_TRIVIAL_EARLY_RETURNS.with(Cell::get) {
         return false;
     }
-    std::env::var_os("DEXDEC_TRIVIAL_CROSSCHECK").is_none()
+    if std::env::var_os("DEXDEC_TRIVIAL_CROSSCHECK").is_some() {
+        return false;
+    }
+    !env_flag_disabled("DEXDEC_TRIVIAL_FASTPATH")
+}
+
+fn env_flag_disabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let value = value.trim();
+            value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off")
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn disable_trivial_early_returns<T>(f: impl FnOnce() -> T) -> T {
@@ -4385,8 +4406,11 @@ impl<'a> FiniteExitAnalysis<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::analysis::{ClassHierarchyIndex, SsaValueGraph};
-    use crate::ir::{Block, ExceptionHandler, InsnNode, RegionGraphBuilder, RegionKind};
+    use crate::ir::analysis::{ClassHierarchyIndex, PhiMerge, SsaValueGraph, SsaVar};
+    use crate::ir::{
+        Block, ExceptionHandler, IfOp, InsnArg, InsnNode, InstructionId, RegionGraphBuilder,
+        RegionKind,
+    };
 
     fn straight_line_cfg() -> CFG {
         let mut cfg = CFG::new("trivial");
@@ -4417,6 +4441,50 @@ mod tests {
         cfg.add_block(Block::new(0u32));
         cfg.add_block(Block::new(1u32));
         assert!(!is_straight_line(&cfg, &SsaValueGraph::default()));
+    }
+
+    #[test]
+    fn rejects_if_switch_handler_and_phi_as_straight_line() {
+        let empty = SsaValueGraph::default();
+
+        let mut cfg = CFG::new("if");
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::if_cmp(
+            IfOp::Eq,
+            InsnArg::lit(0, ArgType::INT),
+            InsnArg::lit(1, ArgType::INT),
+            0,
+        ));
+        cfg.add_block(block);
+        assert!(!is_straight_line(&cfg, &empty));
+
+        let mut cfg = CFG::new("switch");
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::switch(
+            InsnArg::lit(0, ArgType::INT),
+            vec![(0, 0)],
+        ));
+        cfg.add_block(block);
+        assert!(!is_straight_line(&cfg, &empty));
+
+        let mut cfg = CFG::new("handler");
+        let mut block = Block::new(0u32);
+        block.push(InsnNode::return_void());
+        cfg.add_block(block);
+        cfg.handlers
+            .push(ExceptionHandler::new(0, 1, 0, Some(ArgType::throwable())));
+        assert!(!is_straight_line(&cfg, &empty));
+
+        // A real one-block CFG cannot grow a join phi; inject one to lock the
+        // `values.phis().is_empty()` clause.
+        let cfg = straight_line_cfg();
+        let values = SsaValueGraph::with_phis_for_test(vec![PhiMerge {
+            block: BlockId::new(0),
+            instruction: InstructionId::new(0),
+            result: SsaVar::new(0, 1),
+            inputs: Vec::new(),
+        }]);
+        assert!(!is_straight_line(&cfg, &values));
     }
 
     #[test]

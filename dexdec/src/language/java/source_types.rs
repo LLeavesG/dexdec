@@ -45,7 +45,7 @@ fn owner_type_parameter_name(argument: &TypeArgument) -> Option<&str> {
     }
 }
 
-pub(crate) trait GenericTypeProjection: std::fmt::Debug + Send + Sync {
+pub(crate) trait GenericTypeProjection: std::fmt::Debug {
     fn specialize_subtype(
         &self,
         subtype: &ArgType,

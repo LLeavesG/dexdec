@@ -294,7 +294,7 @@ struct JavaTypeLowering<'a> {
     constructor_method_return_types: ConstructorMethodReturnTypes,
     source_object_types: std::sync::Arc<std::collections::BTreeMap<ArgType, JavaType>>,
     outer_instances: std::collections::BTreeMap<crate::ir::FieldReference, ArgType>,
-    generic_type_projection: std::sync::Arc<dyn crate::language::java::GenericTypeProjection>,
+    generic_type_projection: std::rc::Rc<dyn crate::language::java::GenericTypeProjection>,
     observer: std::sync::Arc<dyn crate::ir::AnalysisObserver>,
 }
 
@@ -309,14 +309,16 @@ struct SourceGenericTypeProjection {
 #[derive(Debug, Default)]
 struct GenericProjectionCache {
     specialized:
-        std::sync::Mutex<std::collections::BTreeMap<(ArgType, JavaType), Option<JavaType>>>,
-    inferred: std::sync::Mutex<std::collections::BTreeMap<(ArgType, JavaType), Option<JavaType>>>,
-    projected: std::sync::Mutex<std::collections::BTreeMap<(JavaType, ArgType), Option<JavaType>>>,
-    subtype_relations: std::sync::Mutex<
+        std::cell::RefCell<std::collections::BTreeMap<(ArgType, JavaType), Option<JavaType>>>,
+    inferred: std::cell::RefCell<std::collections::BTreeMap<(ArgType, JavaType), Option<JavaType>>>,
+    projected:
+        std::cell::RefCell<std::collections::BTreeMap<(JavaType, ArgType), Option<JavaType>>>,
+    subtype_relations: std::cell::RefCell<
         std::collections::BTreeMap<(ArgType, ArgType), crate::ir::analysis::SubtypeRelation>,
     >,
-    common_types: std::sync::Mutex<std::collections::BTreeMap<(ArgType, ArgType), Option<ArgType>>>,
-    resolved: std::sync::Mutex<std::collections::BTreeMap<ArgType, JavaType>>,
+    common_types:
+        std::cell::RefCell<std::collections::BTreeMap<(ArgType, ArgType), Option<ArgType>>>,
+    resolved: std::cell::RefCell<std::collections::BTreeMap<ArgType, JavaType>>,
 }
 
 impl SourceGenericTypeProjection {
@@ -349,7 +351,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
         expected_supertype: &JavaType,
     ) -> Option<JavaType> {
         let key = (subtype.clone(), expected_supertype.clone());
-        if let Some(result) = self.cache.specialized.lock().ok()?.get(&key).cloned() {
+        if let Some(result) = self.cache.specialized.borrow().get(&key).cloned() {
             return result;
         }
         let result = self
@@ -359,15 +361,14 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
             .and_then(|specialized| self.names.resolve_generic_type(&specialized).ok());
         self.cache
             .specialized
-            .lock()
-            .ok()?
+            .borrow_mut()
             .insert(key, result.clone());
         result
     }
 
     fn infer_subtype(&self, subtype: &ArgType, expected_supertype: &JavaType) -> Option<JavaType> {
         let key = (subtype.clone(), expected_supertype.clone());
-        if let Some(result) = self.cache.inferred.lock().ok()?.get(&key).cloned() {
+        if let Some(result) = self.cache.inferred.borrow().get(&key).cloned() {
             return result;
         }
         let result = self
@@ -375,7 +376,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
             .source_signature(expected_supertype)
             .and_then(|expected| self.source_abi.infer_subtype(subtype, &expected))
             .and_then(|inferred| self.names.resolve_generic_type(&inferred).ok());
-        self.cache.inferred.lock().ok()?.insert(key, result.clone());
+        self.cache.inferred.borrow_mut().insert(key, result.clone());
         result
     }
 
@@ -385,7 +386,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
         expected_supertype: &ArgType,
     ) -> Option<JavaType> {
         let key = (subtype.clone(), expected_supertype.clone());
-        if let Some(result) = self.cache.projected.lock().ok()?.get(&key).cloned() {
+        if let Some(result) = self.cache.projected.borrow().get(&key).cloned() {
             return result;
         }
         let result = self
@@ -398,8 +399,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
             .and_then(|projected| self.names.resolve_generic_type(&projected).ok());
         self.cache
             .projected
-            .lock()
-            .ok()?
+            .borrow_mut()
             .insert(key, result.clone());
         result
     }
@@ -411,13 +411,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
     ) -> crate::ir::analysis::SubtypeRelation {
         use crate::ir::analysis::{SubtypeRelation, TypeHierarchy};
         let key = (subtype.clone(), supertype.clone());
-        if let Some(result) = self
-            .cache
-            .subtype_relations
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&key).copied())
-        {
+        if let Some(result) = self.cache.subtype_relations.borrow().get(&key).copied() {
             return result;
         }
         let source_relation = (self.source_abi.is_subtype(subtype, supertype)
@@ -437,9 +431,10 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
                 }
                 _ => SubtypeRelation::Unknown,
             });
-        if let Ok(mut cache) = self.cache.subtype_relations.lock() {
-            cache.insert(key, result);
-        }
+        self.cache
+            .subtype_relations
+            .borrow_mut()
+            .insert(key, result);
         result
     }
 
@@ -450,7 +445,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
         } else {
             (right.clone(), left.clone())
         };
-        if let Some(result) = self.cache.common_types.lock().ok()?.get(&key).cloned() {
+        if let Some(result) = self.cache.common_types.borrow().get(&key).cloned() {
             return result;
         }
         let result = match (left.as_object(), right.as_object()) {
@@ -462,8 +457,7 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
         };
         self.cache
             .common_types
-            .lock()
-            .ok()?
+            .borrow_mut()
             .insert(key, result.clone());
         result
     }
@@ -473,32 +467,23 @@ impl crate::language::java::GenericTypeProjection for SourceGenericTypeProjectio
     }
 
     fn resolve_type(&self, ty: &ArgType) -> Option<JavaType> {
-        if let Some(resolved) = self
-            .cache
-            .resolved
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(ty).cloned())
-        {
+        if let Some(resolved) = self.cache.resolved.borrow().get(ty).cloned() {
             return Some(resolved);
         }
         let resolved = self.names.resolve_type(ty).ok()?;
-        if let Ok(mut cache) = self.cache.resolved.lock() {
-            cache.insert(ty.clone(), resolved.clone());
-        }
+        self.cache
+            .resolved
+            .borrow_mut()
+            .insert(ty.clone(), resolved.clone());
         Some(resolved)
     }
 
     fn erasure_of(&self, ty: &JavaType) -> Option<ArgType> {
         self.cache
             .resolved
-            .lock()
-            .ok()
-            .and_then(|cache| {
-                cache
-                    .iter()
-                    .find_map(|(erased, source)| (source == ty).then(|| erased.clone()))
-            })
+            .borrow()
+            .iter()
+            .find_map(|(erased, source)| (source == ty).then(|| erased.clone()))
             .or_else(|| {
                 self.names
                     .source_signature(ty)
@@ -548,7 +533,7 @@ impl<'a> JavaTypeLowering<'a> {
             constructor_method_return_types,
             source_object_types: std::sync::Arc::new(source_object_types),
             outer_instances,
-            generic_type_projection: std::sync::Arc::new(SourceGenericTypeProjection {
+            generic_type_projection: std::rc::Rc::new(SourceGenericTypeProjection {
                 names: names.clone(),
                 source_abi: shared_source_abi,
                 hierarchy,

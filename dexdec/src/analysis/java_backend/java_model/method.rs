@@ -185,7 +185,7 @@ impl JavaMethodBody {
                 crate::ir::generic_types::GenericMethodContract,
             >,
         >,
-        source_object_types: std::sync::Arc<std::collections::BTreeMap<ArgType, JavaType>>,
+        source_object_types: std::sync::Arc<crate::language::java::SourceObjectTypes>,
         generic_type_projection: std::sync::Arc<dyn crate::language::java::GenericTypeProjection>,
         source_current_type: Option<JavaType>,
         source_super_type: Option<JavaType>,

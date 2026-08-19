@@ -16,6 +16,54 @@ use crate::ir::{
 
 use super::{JavaClassType, JavaClassTypeSegment, JavaIdentifier, JavaType, JavaTypeArgument};
 
+/// Function-object identities visible to Java body lowering.
+///
+/// A miss is treated as "not a function object" at runtime. Debug builds panic
+/// when the missed identity exists in the full ABI so tests cannot silently
+/// lower a lambda as a constructor call.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceObjectTypes {
+    types: BTreeMap<ArgType, JavaType>,
+    identities: Arc<BTreeSet<ArgType>>,
+}
+
+impl SourceObjectTypes {
+    pub(crate) fn new(
+        types: BTreeMap<ArgType, JavaType>,
+        identities: Arc<BTreeSet<ArgType>>,
+    ) -> Self {
+        Self { types, identities }
+    }
+
+    pub(crate) fn get(&self, ty: &ArgType) -> Option<&JavaType> {
+        if let Some(resolved) = self.types.get(ty) {
+            return Some(resolved);
+        }
+        debug_assert!(
+            !self.identities.contains(ty),
+            "source_object_types miss for function object {ty:?}"
+        );
+        None
+    }
+
+    pub(crate) fn contains_key(&self, ty: &ArgType) -> bool {
+        self.get(ty).is_some()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&ArgType, &JavaType)> {
+        self.types.iter()
+    }
+}
+
+impl From<BTreeMap<ArgType, JavaType>> for SourceObjectTypes {
+    fn from(types: BTreeMap<ArgType, JavaType>) -> Self {
+        Self {
+            types,
+            identities: Arc::new(BTreeSet::new()),
+        }
+    }
+}
+
 pub(super) fn invocation_expression_signature<'a>(
     operation: &SemanticOperation,
     contract: &'a GenericMethodContract,
@@ -151,7 +199,7 @@ impl JavaTypeErasureIndex {
 pub(super) struct JavaTypeRelations<'a> {
     source_types: &'a BTreeMap<ArgType, JavaType>,
     source_erasures: Option<&'a JavaTypeErasureIndex>,
-    direct_supertypes: Option<&'a BTreeMap<ArgType, JavaType>>,
+    direct_supertypes: Option<&'a SourceObjectTypes>,
     variable_erasures: &'a BTreeMap<JavaIdentifier, ArgType>,
     variable_bounds: Option<&'a BTreeMap<JavaIdentifier, JavaType>>,
     hierarchy: Option<&'a dyn GenericTypeProjection>,
@@ -181,7 +229,7 @@ impl<'a> JavaTypeRelations<'a> {
 
     pub(super) fn with_direct_supertypes(
         mut self,
-        supertypes: Option<&'a BTreeMap<ArgType, JavaType>>,
+        supertypes: Option<&'a SourceObjectTypes>,
     ) -> Self {
         self.direct_supertypes = supertypes;
         self
@@ -2513,7 +2561,7 @@ impl SourceTypeFacts {
 pub(super) struct SourceTypeFlow<'a> {
     fields: &'a BTreeMap<FieldReference, JavaType>,
     generic_fields: &'a BTreeMap<FieldReference, GenericFieldContract>,
-    object_types: &'a BTreeMap<ArgType, JavaType>,
+    object_types: &'a SourceObjectTypes,
     generic_methods: &'a BTreeMap<MethodReference, GenericMethodContract>,
     generic_projection: Option<&'a dyn GenericTypeProjection>,
     source_types: &'a BTreeMap<ArgType, JavaType>,
@@ -2559,7 +2607,7 @@ impl<'a> SourceTypeFlow<'a> {
         root: &crate::ir::SemanticNode,
         fields: &'a BTreeMap<FieldReference, JavaType>,
         generic_fields: &'a BTreeMap<FieldReference, GenericFieldContract>,
-        object_types: &'a BTreeMap<ArgType, JavaType>,
+        object_types: &'a SourceObjectTypes,
         generic_methods: &'a BTreeMap<MethodReference, GenericMethodContract>,
         generic_projection: Option<&'a dyn GenericTypeProjection>,
         source_types: &'a BTreeMap<ArgType, JavaType>,
@@ -5993,7 +6041,7 @@ mod tests {
                 class("java/util/function/Function", Vec::new()),
             ),
         ]);
-        let direct_supertypes = BTreeMap::from([(
+        let direct_supertypes = SourceObjectTypes::from(BTreeMap::from([(
             ArgType::object("example/SyntheticFunction"),
             class(
                 "java/util/function/Function",
@@ -6002,7 +6050,7 @@ mod tests {
                     JavaTypeArgument::Exact(class("java/lang/String", Vec::new())),
                 ],
             ),
-        )]);
+        )]));
         let variables = BTreeMap::new();
         let relations = JavaTypeRelations::new(&source_types, &variables, None)
             .with_direct_supertypes(Some(&direct_supertypes));
@@ -6709,5 +6757,39 @@ mod tests {
             solver.owner_type(&stream_owner),
             Some(class("java/util/stream/Stream", Vec::new()))
         );
+    }
+
+    #[test]
+    fn source_object_types_miss_of_known_function_object_fails_in_debug() {
+        let identity = ArgType::object("example/Fn");
+        let types = SourceObjectTypes::new(
+            BTreeMap::new(),
+            Arc::new(BTreeSet::from([identity.clone()])),
+        );
+        if cfg!(debug_assertions) {
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                types.contains_key(&identity)
+            }))
+            .is_err();
+            assert!(
+                panicked,
+                "cropped source_object_types must not silently treat a function object as missing"
+            );
+        } else {
+            assert!(!types.contains_key(&identity));
+        }
+        assert!(!types.contains_key(&ArgType::object("java/lang/Object")));
+    }
+
+    #[test]
+    fn source_object_types_get_returns_resolved_function_object() {
+        let identity = ArgType::object("example/Fn");
+        let interface = class("java/lang/Runnable", Vec::new());
+        let types = SourceObjectTypes::new(
+            BTreeMap::from([(identity.clone(), interface.clone())]),
+            Arc::new(BTreeSet::from([identity.clone()])),
+        );
+        assert_eq!(types.get(&identity), Some(&interface));
+        assert!(types.contains_key(&identity));
     }
 }

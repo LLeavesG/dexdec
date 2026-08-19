@@ -14,6 +14,48 @@ fn loads_platform_symbol_methods() {
 }
 
 #[test]
+fn fills_platform_class_details_in_place() {
+    let platform = PlatformClassSet::load_default().expect("platform symbols should load");
+    assert_eq!(platform.cached_class_count(), 0);
+    assert!(!platform.is_frozen());
+
+    let first = platform
+        .class_details(&ArgType::object("java/util/AbstractMap"))
+        .expect("AbstractMap should parse while Filling");
+    assert_eq!(platform.cached_class_count(), 1);
+    let second = platform
+        .class_details(&ArgType::object("java/util/AbstractMap"))
+        .expect("AbstractMap should hit the in-place cache");
+    assert_eq!(first, second);
+    assert_eq!(platform.cached_class_count(), 1);
+}
+
+#[test]
+fn frozen_platform_details_parse_misses_without_write_back() {
+    let platform = PlatformClassSet::load_default().expect("platform symbols should load");
+    platform
+        .class_details(&ArgType::object("java/util/AbstractMap"))
+        .expect("warm AbstractMap before freeze");
+    platform.freeze_details();
+    assert!(platform.is_frozen());
+    assert_eq!(platform.cached_class_count(), 1);
+
+    let list = platform
+        .class_details(&ArgType::object("java/util/List"))
+        .expect("Frozen miss must still parse a symbol-set class");
+    assert!(list
+        .methods
+        .iter()
+        .any(|method| { method.reference.short_id == "addAll(Ljava/util/Collection;)Z" }));
+    assert_eq!(platform.cached_class_count(), 1);
+    assert!(platform.is_frozen());
+
+    platform.freeze_details();
+    assert!(platform.is_frozen());
+    assert_eq!(platform.cached_class_count(), 1);
+}
+
+#[test]
 fn embedded_platform_resource_is_available() {
     let platform = default_platform_symbols().expect("embedded dexsym parses");
     assert!(platform.class("Ljava/util/Map;").is_some());

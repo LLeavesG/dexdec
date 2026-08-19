@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::frontend::{
     AccessInfo, AnalysisDiagnostic, AnalysisLocation, ClassNode, DexFileReader, MethodNode,
@@ -1285,17 +1285,23 @@ impl ClassHierarchy for CompositeClassHierarchy {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+enum DetailsTable {
+    Filling(HashMap<String, ClassDetails>),
+    Frozen(Arc<HashMap<String, ClassDetails>>),
+}
+
+#[derive(Debug)]
 pub(crate) struct PlatformClassSet {
     symbols: Arc<PlatformSymbolSet>,
-    details: Arc<std::sync::RwLock<BTreeMap<String, ClassDetails>>>,
+    details: RwLock<DetailsTable>,
 }
 
 impl PlatformClassSet {
     pub fn load_default() -> io::Result<Self> {
         Ok(Self {
             symbols: default_platform_symbols()?,
-            details: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            details: RwLock::new(DetailsTable::Filling(HashMap::new())),
         })
     }
 
@@ -1316,22 +1322,95 @@ impl PlatformClassSet {
         }
     }
 
+    pub(crate) fn freeze_details(&self) {
+        let Ok(mut table) = self.details.write() else {
+            return;
+        };
+        if let DetailsTable::Filling(map) = &mut *table {
+            let map = std::mem::take(map);
+            *table = DetailsTable::Frozen(Arc::new(map));
+        }
+    }
+
     fn class_details(&self, ty: &ArgType) -> Option<ClassDetails> {
         let descriptor = ty.to_descriptor();
-        if let Some(details) = self
-            .details
-            .read()
-            .ok()
-            .and_then(|details| details.get(&descriptor).cloned())
-        {
-            return Some(details);
+        match self.details.read() {
+            Ok(table) => match &*table {
+                DetailsTable::Frozen(frozen) => {
+                    if let Some(details) = frozen.get(&descriptor).cloned() {
+                        return Some(details);
+                    }
+                    drop(table);
+                    return parse_symbol_class_details(&self.symbols, &descriptor);
+                }
+                DetailsTable::Filling(map) => {
+                    if let Some(details) = map.get(&descriptor).cloned() {
+                        return Some(details);
+                    }
+                }
+            },
+            Err(_) => return parse_symbol_class_details(&self.symbols, &descriptor),
         }
-        let details = platform_class_details(self.symbols.class(&descriptor)?).ok()?;
-        if let Ok(mut cache) = self.details.write() {
-            cache.entry(descriptor).or_insert_with(|| details.clone());
+
+        let mut table = match self.details.write() {
+            Ok(table) => table,
+            Err(_) => return parse_symbol_class_details(&self.symbols, &descriptor),
+        };
+        match &mut *table {
+            DetailsTable::Frozen(frozen) => {
+                if let Some(details) = frozen.get(&descriptor).cloned() {
+                    return Some(details);
+                }
+                drop(table);
+                parse_symbol_class_details(&self.symbols, &descriptor)
+            }
+            DetailsTable::Filling(map) => {
+                if let Some(details) = map.get(&descriptor).cloned() {
+                    return Some(details);
+                }
+                let details = parse_symbol_class_details(&self.symbols, &descriptor)?;
+                map.insert(descriptor, details.clone());
+                Some(details)
+            }
         }
-        Some(details)
     }
+
+    #[cfg(test)]
+    fn cached_class_count(&self) -> usize {
+        match self.details.read() {
+            Ok(table) => match &*table {
+                DetailsTable::Filling(map) => map.len(),
+                DetailsTable::Frozen(map) => map.len(),
+            },
+            Err(_) => 0,
+        }
+    }
+
+    fn is_frozen(&self) -> bool {
+        matches!(self.details.read().as_deref(), Ok(DetailsTable::Frozen(_)))
+    }
+}
+
+fn parse_symbol_class_details(
+    symbols: &PlatformSymbolSet,
+    descriptor: &str,
+) -> Option<ClassDetails> {
+    symbols
+        .class(descriptor)
+        .and_then(|class| platform_class_details(class).ok())
+}
+
+pub fn freeze_default_platform_class_details() {
+    if let Ok(platform) = PlatformClassSet::default_cached() {
+        platform.freeze_details();
+    }
+}
+
+#[doc(hidden)]
+pub fn default_platform_class_details_are_frozen() -> bool {
+    PlatformClassSet::default_cached()
+        .ok()
+        .is_some_and(|platform| platform.is_frozen())
 }
 
 fn platform_class_details(class: &PlatformClass) -> io::Result<ClassDetails> {

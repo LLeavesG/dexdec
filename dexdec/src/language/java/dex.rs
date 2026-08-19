@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ir::analysis::{SourceTypeEnvironment, TypeConstraintError};
@@ -199,7 +200,7 @@ pub struct DexJavaDialect {
     generic_fields: Arc<BTreeMap<FieldReference, GenericFieldContract>>,
     source_object_types: Arc<BTreeMap<ArgType, JavaType>>,
     generic_methods: Arc<BTreeMap<MethodReference, GenericMethodContract>>,
-    generic_type_projection: Option<Arc<dyn GenericTypeProjection>>,
+    generic_type_projection: Option<Rc<dyn GenericTypeProjection>>,
     declared: BTreeSet<JavaIdentifier>,
     locals: BTreeMap<JavaIdentifier, JavaType>,
     current_type: Option<ArgType>,
@@ -440,7 +441,7 @@ impl DexJavaDialect {
 
     pub(crate) fn with_generic_type_projection(
         mut self,
-        projection: Arc<dyn GenericTypeProjection>,
+        projection: Rc<dyn GenericTypeProjection>,
     ) -> Self {
         self.generic_type_projection = Some(projection);
         self

@@ -1067,6 +1067,51 @@ impl JavaSourceAbi {
         })
     }
 
+    #[cfg(test)]
+    fn generic_field_scan(&self, field: &FieldReference) -> Option<GenericFieldContract> {
+        if let Some(contract) = self.field_types.get(field) {
+            return Some(contract.clone());
+        }
+        let hierarchy = self.generic_hierarchy.as_ref()?;
+        let mut nearest: Option<(&FieldReference, &GenericFieldContract)> = None;
+        for (candidate, contract) in self.field_types.iter().filter(|(candidate, _)| {
+            candidate.name == field.name
+                && candidate.field_type == field.field_type
+                && hierarchy.is_subtype(&field.owner, &candidate.owner)
+        }) {
+            nearest = match nearest {
+                None => Some((candidate, contract)),
+                Some((current, _)) if hierarchy.is_subtype(&candidate.owner, &current.owner) => {
+                    Some((candidate, contract))
+                }
+                Some((current, current_contract))
+                    if hierarchy.is_subtype(&current.owner, &candidate.owner) =>
+                {
+                    Some((current, current_contract))
+                }
+                Some(_) => return None,
+            };
+        }
+        let (declaring_field, contract) = nearest?;
+        if declaring_field.owner == field.owner {
+            return Some(contract.clone());
+        }
+        let Some(instantiated_owner) = self.owner_types.get(&field.owner) else {
+            return Some(contract.clone());
+        };
+        let Some(signature) = hierarchy.project_member_type(
+            &JvmTypeSignature::ClassType(instantiated_owner.clone()),
+            &contract.owner,
+            &contract.signature,
+        ) else {
+            return Some(contract.clone());
+        };
+        Some(GenericFieldContract {
+            signature,
+            owner: instantiated_owner.clone(),
+        })
+    }
+
     pub(crate) fn generic_fields<'a>(
         &self,
         fields: impl IntoIterator<Item = &'a FieldReference>,
@@ -1566,5 +1611,119 @@ impl JavaSourceAbi {
             .flat_map(|signature| signature.type_parameters)
             .map(|parameter| TypeArgument::Exact(JvmTypeSignature::TypeVariable(parameter.name)))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::{ClassInfo, FieldInfo, FieldNode};
+
+    fn class(descriptor: &str) -> ClassNode {
+        let info = ClassInfo::from_type_descriptor(descriptor).expect("class descriptor");
+        ClassNode::new(0, info, AccessInfo::for_class(0x0001))
+    }
+
+    fn signed_field(
+        owner: &ClassNode,
+        name: &str,
+        field_type: ArgType,
+        signature: &str,
+    ) -> FieldNode {
+        let mut field = FieldNode::new(
+            0,
+            FieldInfo::new(
+                owner.type_descriptor().to_string(),
+                name.to_string(),
+                field_type,
+            ),
+            AccessInfo::for_field(0x0001),
+        );
+        field.signature = Some(signature.to_string());
+        field
+    }
+
+    fn analyze(classes: &[&ClassNode]) -> JavaSourceAbi {
+        JavaSourceAbi::analyze(classes.iter().copied(), |_| (Vec::new(), None))
+    }
+
+    fn field_ref(owner: &str, name: &str, field_type: ArgType) -> FieldReference {
+        FieldReference {
+            owner: owner.parse().expect("owner"),
+            name: name.to_string(),
+            field_type,
+        }
+    }
+
+    fn assert_generic_field_matches_scan(abi: &JavaSourceAbi, field: &FieldReference) {
+        assert_eq!(
+            abi.generic_field(field),
+            abi.generic_field_scan(field),
+            "indexed generic_field must match a full field_types scan for {field:?}"
+        );
+    }
+
+    #[test]
+    fn generic_field_index_matches_scan_for_declared_field() {
+        let mut child = class("Lcom/example/Child;");
+        child.add_field(signed_field(
+            &child,
+            "value",
+            ArgType::string(),
+            "Ljava/lang/String;",
+        ));
+        let abi = analyze(&[&child]);
+        let field = field_ref("Lcom/example/Child;", "value", ArgType::string());
+        let contract = abi.generic_field(&field).expect("declared field contract");
+        assert_eq!(
+            contract.signature,
+            GenericSignatures::field("Ljava/lang/String;").expect("signature")
+        );
+        assert_generic_field_matches_scan(&abi, &field);
+    }
+
+    #[test]
+    fn generic_field_index_matches_scan_for_inherited_parent() {
+        let mut parent = class("Lcom/example/Parent;");
+        parent.add_field(signed_field(
+            &parent,
+            "value",
+            ArgType::string(),
+            "Ljava/lang/String;",
+        ));
+        let mut child = class("Lcom/example/Child;");
+        child.set_super_class("Lcom/example/Parent;".parse().expect("parent"));
+        let abi = analyze(&[&parent, &child]);
+        let field = field_ref("Lcom/example/Child;", "value", ArgType::string());
+        assert!(
+            abi.generic_field(&field).is_some(),
+            "child miss should recover the parent field contract"
+        );
+        assert_generic_field_matches_scan(&abi, &field);
+    }
+
+    #[test]
+    fn generic_field_index_matches_scan_for_incomparable_parents() {
+        let mut left = class("Lcom/example/Left;");
+        left.add_field(signed_field(
+            &left,
+            "value",
+            ArgType::string(),
+            "Ljava/lang/String;",
+        ));
+        let mut right = class("Lcom/example/Right;");
+        right.add_field(signed_field(
+            &right,
+            "value",
+            ArgType::string(),
+            "Ljava/lang/String;",
+        ));
+        let mut child = class("Lcom/example/Child;");
+        child.set_super_class("Lcom/example/Left;".parse().expect("left"));
+        child.add_interface("Lcom/example/Right;".parse().expect("right"));
+        let abi = analyze(&[&left, &right, &child]);
+        let field = field_ref("Lcom/example/Child;", "value", ArgType::string());
+        assert_eq!(abi.generic_field(&field), None);
+        assert_generic_field_matches_scan(&abi, &field);
     }
 }

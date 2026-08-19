@@ -882,8 +882,47 @@ impl GenericTypeHierarchy {
         }
         let grouped = self.collect_owner_overloads(owner);
         if let Ok(mut index) = self.method_overloads.by_owner.write() {
-            index.entry(owner.clone()).or_insert(grouped);
+            // Recheck after the walk so a concurrent fill of the same owner is kept.
+            if !index.contains_key(owner) {
+                index.insert(owner.clone(), grouped);
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn method_overloads_walk(
+        &self,
+        method: &crate::ir::MethodReference,
+    ) -> Vec<crate::ir::MethodReference> {
+        let mut overloads = BTreeSet::new();
+        let mut pending = vec![method.owner.clone()];
+        let mut visited = BTreeSet::new();
+        while let Some(owner) = pending.pop() {
+            if !visited.insert(owner.clone()) {
+                continue;
+            }
+            let Some(declared) = self.hierarchy.class_details(&owner) else {
+                continue;
+            };
+            overloads.extend(
+                declared
+                    .methods
+                    .iter()
+                    .filter_map(|candidate| Self::ir_method_reference(&candidate.reference))
+                    .filter(|candidate| {
+                        candidate.name == method.name
+                            && candidate.descriptor.parameters.len()
+                                == method.descriptor.parameters.len()
+                    })
+                    .map(|candidate| crate::ir::MethodReference {
+                        owner: method.owner.clone(),
+                        name: candidate.name,
+                        descriptor: candidate.descriptor,
+                    }),
+            );
+            pending.extend(declared.parents);
+        }
+        overloads.into_iter().collect()
     }
 
     fn collect_owner_overloads(&self, owner: &ArgType) -> MethodOverloadsByKey {

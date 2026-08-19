@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,12 +24,25 @@ pub trait TypeHierarchy: Send + Sync {
     fn least_common_supertype(&self, left: &str, right: &str) -> Option<String>;
 }
 
+#[derive(Debug)]
+enum DistanceTable {
+    Building(RwLock<HashMap<String, Arc<BTreeMap<String, usize>>>>),
+    Frozen(Arc<HashMap<String, Arc<BTreeMap<String, usize>>>>),
+}
+
+impl Default for DistanceTable {
+    fn default() -> Self {
+        Self::Building(RwLock::new(HashMap::new()))
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ClassHierarchyIndex {
     parents: HashMap<String, BTreeSet<String>>,
     reference_types: HashMap<String, ReferenceTypeInfo>,
     base: Option<Arc<ClassHierarchyIndex>>,
-    distances: Arc<RwLock<HashMap<String, Arc<BTreeMap<String, usize>>>>>,
+    distances: DistanceTable,
+    frozen_required: bool,
 }
 
 impl Clone for ClassHierarchyIndex {
@@ -38,7 +51,13 @@ impl Clone for ClassHierarchyIndex {
             parents: self.parents.clone(),
             reference_types: self.reference_types.clone(),
             base: self.base.clone(),
-            distances: Arc::default(),
+            distances: match &self.distances {
+                DistanceTable::Frozen(map) => DistanceTable::Frozen(Arc::clone(map)),
+                DistanceTable::Building(cache) => {
+                    DistanceTable::Building(RwLock::new(Self::read_cache(cache).clone()))
+                }
+            },
+            frozen_required: self.frozen_required,
         }
     }
 }
@@ -49,16 +68,36 @@ impl ClassHierarchyIndex {
             parents: HashMap::new(),
             reference_types: HashMap::new(),
             base: Some(base),
-            distances: Arc::default(),
+            distances: DistanceTable::default(),
+            frozen_required: false,
         }
     }
 
+    pub fn freeze_distances(&mut self) {
+        if matches!(self.distances, DistanceTable::Frozen(_)) {
+            return;
+        }
+
+        let starts = self.distance_start_names();
+        let mut map = HashMap::with_capacity(starts.len());
+        for start in starts {
+            let distances = self.compute_distances(&start);
+            map.insert(start, distances);
+        }
+        self.distances = DistanceTable::Frozen(Arc::new(map));
+    }
+
+    pub(crate) fn set_frozen_required(&mut self, required: bool) {
+        self.frozen_required = required;
+    }
+
     pub fn add(&mut self, class: impl Into<String>, parents: impl IntoIterator<Item = String>) {
+        self.require_building();
         self.parents
             .entry(class.into())
             .or_default()
             .extend(parents);
-        Self::write_cache(&self.distances).clear();
+        self.clear_building_distances();
     }
 
     pub fn add_declared_type(
@@ -76,6 +115,7 @@ impl ClassHierarchyIndex {
         &mut self,
         declarations: impl IntoIterator<Item = (String, Vec<String>, ReferenceTypeInfo)>,
     ) {
+        self.require_building();
         for (class, parents, info) in declarations {
             self.parents
                 .entry(class.clone())
@@ -83,7 +123,7 @@ impl ClassHierarchyIndex {
                 .extend(parents);
             self.reference_types.insert(class, info);
         }
-        Self::write_cache(&self.distances).clear();
+        self.clear_building_distances();
     }
 
     pub fn is_cast_convertible(&self, source: &str, target: &str) -> bool {
@@ -104,9 +144,29 @@ impl ClassHierarchyIndex {
     }
 
     fn distances(&self, start: &str) -> Arc<BTreeMap<String, usize>> {
-        if let Some(distances) = self.read_cache().get(start).cloned() {
-            return distances;
+        debug_assert!(
+            !self.frozen_required || matches!(self.distances, DistanceTable::Frozen(_)),
+            "ClassHierarchyIndex distances must be frozen before sharing"
+        );
+        match &self.distances {
+            DistanceTable::Frozen(map) => {
+                if let Some(distances) = map.get(start) {
+                    return Arc::clone(distances);
+                }
+                self.compute_distances(start)
+            }
+            DistanceTable::Building(cache) => {
+                if let Some(distances) = Self::read_cache(cache).get(start).cloned() {
+                    return distances;
+                }
+                let distances = self.compute_distances(start);
+                Self::write_cache(cache).insert(start.to_string(), Arc::clone(&distances));
+                distances
+            }
         }
+    }
+
+    fn compute_distances(&self, start: &str) -> Arc<BTreeMap<String, usize>> {
         let mut distances = BTreeMap::from([(start.to_string(), 0)]);
         let mut pending = VecDeque::from([(start.to_string(), 0)]);
         while let Some((class, distance)) = pending.pop_front() {
@@ -121,15 +181,45 @@ impl ClassHierarchyIndex {
         distances
             .entry("java/lang/Object".to_string())
             .or_insert(usize::MAX / 4);
-        let distances = Arc::new(distances);
-        Self::write_cache(&self.distances).insert(start.to_string(), Arc::clone(&distances));
-        distances
+        Arc::new(distances)
+    }
+
+    fn distance_start_names(&self) -> HashSet<String> {
+        let mut starts: HashSet<String> = self
+            .parents
+            .keys()
+            .chain(self.reference_types.keys())
+            .cloned()
+            .collect();
+        if let Some(base) = self.base.as_deref() {
+            match &base.distances {
+                DistanceTable::Frozen(map) => {
+                    starts.extend(map.keys().cloned());
+                }
+                DistanceTable::Building(_) => {
+                    starts.extend(base.distance_start_names());
+                }
+            }
+        }
+        starts
+    }
+
+    fn require_building(&self) {
+        if matches!(self.distances, DistanceTable::Frozen(_)) {
+            panic!("cannot mutate a frozen ClassHierarchyIndex");
+        }
+    }
+
+    fn clear_building_distances(&self) {
+        if let DistanceTable::Building(cache) = &self.distances {
+            Self::write_cache(cache).clear();
+        }
     }
 
     fn read_cache(
-        &self,
+        cache: &RwLock<HashMap<String, Arc<BTreeMap<String, usize>>>>,
     ) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<BTreeMap<String, usize>>>> {
-        match self.distances.read() {
+        match cache.read() {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -222,5 +312,60 @@ impl TypeHierarchy for ClassHierarchyIndex {
             })
             .min()
             .map(|(_, _, candidate)| (*candidate).clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_hierarchy() -> ClassHierarchyIndex {
+        let mut index = ClassHierarchyIndex::default();
+        index.add("pkg/Child", ["pkg/Parent".to_string()]);
+        index.add("pkg/Parent", ["java/lang/Object".to_string()]);
+        index.add("java/lang/Object", Vec::<String>::new());
+        index.add("pkg/Orphan", Vec::<String>::new());
+        index
+    }
+
+    #[test]
+    fn freeze_clone_shares_distance_table() {
+        let mut index = sample_hierarchy();
+        index.freeze_distances();
+        let cloned = index.clone();
+        match (&index.distances, &cloned.distances) {
+            (DistanceTable::Frozen(left), DistanceTable::Frozen(right)) => {
+                assert!(Arc::ptr_eq(left, right));
+            }
+            _ => panic!("expected frozen distance tables"),
+        }
+    }
+
+    #[test]
+    fn freeze_distances_includes_object_sentinel() {
+        let mut index = sample_hierarchy();
+        index.freeze_distances();
+        assert_eq!(
+            index
+                .distances("pkg/Orphan")
+                .get("java/lang/Object")
+                .copied(),
+            Some(usize::MAX / 4)
+        );
+        assert_eq!(
+            index
+                .distances("java/lang/Object")
+                .get("java/lang/Object")
+                .copied(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot mutate a frozen ClassHierarchyIndex")]
+    fn add_on_frozen_panics() {
+        let mut index = sample_hierarchy();
+        index.freeze_distances();
+        index.add("pkg/Other", Vec::<String>::new());
     }
 }

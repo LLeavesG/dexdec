@@ -1538,6 +1538,7 @@ fn platform_hierarchy_index() -> OverrideResult<Arc<ClassHierarchyIndex>> {
                     },
                 );
             }
+            freeze_shared_hierarchy(&mut index);
             let index = Arc::new(index);
             match PLATFORM_HIERARCHY.set(Arc::clone(&index)) {
                 Ok(()) => Ok(index),
@@ -1572,7 +1573,21 @@ pub(crate) fn type_hierarchy_index(reader: &DexFileReader) -> OverrideResult<Cla
         })
         .collect::<OverrideResult<Vec<_>>>()?;
     index.extend_declared_types(declarations);
+    freeze_shared_hierarchy(&mut index);
     Ok(index)
+}
+
+fn freeze_shared_hierarchy(index: &mut ClassHierarchyIndex) {
+    // DEXDEC_HIERARCHY_LAZY=1 keeps a shared Building table for A/B comparison.
+    if hierarchy_lazy_distances() {
+        return;
+    }
+    index.freeze_distances();
+    index.set_frozen_required(true);
+}
+
+fn hierarchy_lazy_distances() -> bool {
+    std::env::var_os("DEXDEC_HIERARCHY_LAZY").is_some_and(|value| value == "1")
 }
 
 fn hierarchy_object_name(descriptor: &str) -> OverrideResult<String> {

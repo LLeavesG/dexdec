@@ -33,7 +33,7 @@ fn fills_platform_class_details_in_place() {
 }
 
 #[test]
-fn frozen_platform_details_parse_misses_without_write_back() {
+fn frozen_platform_details_cache_misses_in_extras() {
     let platform = PlatformClassSet::load_default().expect("platform symbols should load");
     platform
         .class_details(&ArgType::object("java/util/AbstractMap"))
@@ -49,12 +49,17 @@ fn frozen_platform_details_parse_misses_without_write_back() {
         .methods
         .iter()
         .any(|method| { method.reference.short_id == "addAll(Ljava/util/Collection;)Z" }));
-    assert_eq!(platform.cached_class_count(), 1);
+    assert_eq!(platform.cached_class_count(), 2);
     assert!(platform.is_frozen());
+    let again = platform
+        .class_details(&ArgType::object("java/util/List"))
+        .expect("Frozen extras should hit without another parse");
+    assert_eq!(list, again);
+    assert_eq!(platform.cached_class_count(), 2);
 
     platform.freeze_details();
     assert!(platform.is_frozen());
-    assert_eq!(platform.cached_class_count(), 1);
+    assert_eq!(platform.cached_class_count(), 2);
 }
 
 #[test]
@@ -767,9 +772,9 @@ struct TestHierarchy {
 }
 
 impl ClassHierarchy for TestHierarchy {
-    fn class_details(&self, ty: &ArgType) -> Option<ClassDetails> {
+    fn class_details(&self, ty: &ArgType) -> Option<std::sync::Arc<ClassDetails>> {
         if ty.to_descriptor() == self.app.descriptor {
-            return Some(self.app.clone());
+            return Some(std::sync::Arc::new(self.app.clone()));
         }
         self.platform.class_details(ty)
     }
@@ -792,8 +797,11 @@ impl LocalHierarchy {
 }
 
 impl ClassHierarchy for LocalHierarchy {
-    fn class_details(&self, ty: &ArgType) -> Option<ClassDetails> {
-        self.classes.get(&ty.to_descriptor()).cloned()
+    fn class_details(&self, ty: &ArgType) -> Option<std::sync::Arc<ClassDetails>> {
+        self.classes
+            .get(&ty.to_descriptor())
+            .cloned()
+            .map(std::sync::Arc::new)
     }
 }
 

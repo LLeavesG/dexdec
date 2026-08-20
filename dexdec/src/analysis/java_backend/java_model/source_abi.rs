@@ -1,10 +1,13 @@
 use crate::frontend::{AccessInfo, ClassNode, MethodNode};
+use crate::ir::analysis::TypeHierarchy;
 use crate::ir::cfg::CFG;
 use crate::ir::generic_types::{
     ClassTypeSignature, GenericFieldContract, GenericMethodContract, GenericSignatures,
     InnerClassTypeSignature, JvmTypeSignature, TypeArgument, TypeParameter,
 };
-use crate::ir::{ArgType, FieldReference, InsnType, MemberReference, MethodReference};
+use crate::ir::{
+    ArgType, FieldReference, InsnType, MemberReference, MethodDescriptor, MethodReference,
+};
 use crate::language::java::{JavaConstructorLayout, JavaIdentifier};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -445,27 +448,48 @@ impl FunctionObjectClass {
 struct InheritedMethodAbi;
 
 impl InheritedMethodAbi {
+    fn owner_is_subtype(
+        subtype: &ArgType,
+        supertype: &ArgType,
+        index: Option<&dyn TypeHierarchy>,
+        generic: &crate::analysis::method_override::GenericTypeHierarchy,
+    ) -> bool {
+        if let Some(index) = index {
+            let Some(subtype_name) = subtype.as_object() else {
+                return subtype == supertype;
+            };
+            let Some(supertype_name) = supertype.as_object() else {
+                return false;
+            };
+            return index.is_subtype(subtype_name, supertype_name);
+        }
+        generic.is_subtype(subtype, supertype)
+    }
+
     fn contract(
         reference: &MethodReference,
         owner: &ClassTypeSignature,
         owner_parameters: &[TypeParameter],
-        methods: &std::collections::BTreeMap<MethodReference, GenericMethodContract>,
+        declarations: &BTreeMap<(String, MethodDescriptor), Vec<(ArgType, GenericMethodContract)>>,
         hierarchy: &crate::analysis::method_override::GenericTypeHierarchy,
+        type_index: Option<&dyn TypeHierarchy>,
     ) -> Option<GenericMethodContract> {
-        let mut nearest: Option<(&MethodReference, &GenericMethodContract)> = None;
-        for (candidate, contract) in methods.iter().filter(|(candidate, _)| {
-            candidate.owner != reference.owner
-                && candidate.name == reference.name
-                && candidate.descriptor == reference.descriptor
-                && hierarchy.is_subtype(&reference.owner, &candidate.owner)
+        let candidates =
+            declarations.get(&(reference.name.clone(), reference.descriptor.clone()))?;
+        let mut nearest: Option<(&ArgType, &GenericMethodContract)> = None;
+        for (candidate_owner, contract) in candidates.iter().filter(|(candidate_owner, _)| {
+            candidate_owner != &reference.owner
+                && Self::owner_is_subtype(&reference.owner, candidate_owner, type_index, hierarchy)
         }) {
             nearest = match nearest {
-                None => Some((candidate, contract)),
-                Some((current, _)) if hierarchy.is_subtype(&candidate.owner, &current.owner) => {
-                    Some((candidate, contract))
+                None => Some((candidate_owner, contract)),
+                Some((current, _))
+                    if Self::owner_is_subtype(candidate_owner, current, type_index, hierarchy) =>
+                {
+                    Some((candidate_owner, contract))
                 }
                 Some((current, current_contract))
-                    if hierarchy.is_subtype(&current.owner, &candidate.owner) =>
+                    if Self::owner_is_subtype(current, candidate_owner, type_index, hierarchy) =>
                 {
                     Some((current, current_contract))
                 }
@@ -625,10 +649,33 @@ impl JavaSourceAbi {
         classes: impl IntoIterator<Item = &'a ClassNode>,
         mut function_signature: impl FnMut(&MethodReference) -> (Vec<Option<ArgType>>, Option<ArgType>),
     ) -> Self {
+        Self::analyze_with_hierarchy(classes, function_signature, None)
+    }
+
+    pub(crate) fn analyze_with_hierarchy<'a>(
+        classes: impl IntoIterator<Item = &'a ClassNode>,
+        mut function_signature: impl FnMut(&MethodReference) -> (Vec<Option<ArgType>>, Option<ArgType>),
+        type_index: Option<&dyn TypeHierarchy>,
+    ) -> Self {
         let classes = classes.into_iter().collect::<Vec<_>>();
+        let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
+        let mark = |name: &str, started: std::time::Instant| {
+            if stats {
+                eprintln!(
+                    "dexdec batch: abi_{name}={:.0}ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        };
+        let t = std::time::Instant::now();
         let open_owners = Self::open_owner_types(&classes);
+        mark("open_owners", t);
+        let t = std::time::Instant::now();
         let lexical_type_parameters = LexicalTypeEnvironment::analyze(&classes);
+        mark("lexical", t);
+        let t = std::time::Instant::now();
         let inherited_member_types = Self::build_inherited_member_types(&classes);
+        mark("inherited_members", t);
         let outer_instances = classes
             .iter()
             .filter_map(|class| OuterInstanceField::analyze(class))
@@ -710,11 +757,13 @@ impl JavaSourceAbi {
             .collect();
         let platform_exceptions =
             crate::analysis::method_override::platform_exception_contracts().unwrap_or_default();
+        let t = std::time::Instant::now();
         let generic_hierarchy =
             crate::analysis::method_override::GenericTypeHierarchy::from_classes(
                 classes.iter().copied(),
             )
             .ok();
+        mark("generic_hierarchy", t);
         let generic_owner_types = &open_owners;
         let mut generic_methods = classes
             .iter()
@@ -768,6 +817,13 @@ impl JavaSourceAbi {
                 })
             })
             .collect::<std::collections::BTreeMap<_, _>>();
+        let t = std::time::Instant::now();
+        let mut generic_method_declarations = std::collections::BTreeMap::new();
+        for (method, contract) in &generic_methods {
+            Self::index_generic_method(&mut generic_method_declarations, method, contract);
+        }
+        mark("generic_methods", t);
+        let t = std::time::Instant::now();
         if let Some(hierarchy) = generic_hierarchy.as_ref() {
             for class in &classes {
                 let owner = open_owners
@@ -795,14 +851,21 @@ impl JavaSourceAbi {
                         &reference,
                         &owner,
                         &owner_parameters,
-                        &generic_methods,
+                        &generic_method_declarations,
                         hierarchy,
+                        type_index,
                     ) {
+                        Self::index_generic_method(
+                            &mut generic_method_declarations,
+                            &reference,
+                            &contract,
+                        );
                         generic_methods.insert(reference, contract);
                     }
                 }
             }
         }
+        mark("bridge_contracts", t);
         let platform_generic_hierarchy =
             crate::analysis::method_override::GenericTypeHierarchy::from_classes(
                 std::iter::empty::<&ClassNode>(),
@@ -822,13 +885,6 @@ impl JavaSourceAbi {
             .map(|name| name.replace('/', "."))
             .collect();
         let externally_referenced_nested_types = Self::externally_referenced_nested_types(&classes);
-        let mut generic_method_declarations = std::collections::BTreeMap::new();
-        for (method, contract) in &generic_methods {
-            generic_method_declarations
-                .entry((method.name.clone(), method.descriptor.clone()))
-                .or_insert_with(Vec::new)
-                .push((method.owner.clone(), contract.clone()));
-        }
         let mut generic_field_declarations: std::collections::BTreeMap<
             (String, ArgType),
             Vec<(ArgType, GenericFieldContract)>,
@@ -941,6 +997,20 @@ impl JavaSourceAbi {
         !self
             .inaccessible_top_level_imports
             .contains(&import.to_string())
+    }
+
+    fn index_generic_method(
+        declarations: &mut BTreeMap<
+            (String, MethodDescriptor),
+            Vec<(ArgType, GenericMethodContract)>,
+        >,
+        method: &MethodReference,
+        contract: &GenericMethodContract,
+    ) {
+        declarations
+            .entry((method.name.clone(), method.descriptor.clone()))
+            .or_default()
+            .push((method.owner.clone(), contract.clone()));
     }
 
     fn method_overloads(classes: &[&ClassNode]) -> Vec<MethodReference> {

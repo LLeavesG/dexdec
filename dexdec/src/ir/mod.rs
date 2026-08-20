@@ -82,7 +82,6 @@ pub use region::{
     RegionTransferKind, RegionTree, ResolvedRegionExit, StructuredRegion, SwitchRegion,
     SynchronizedRegion,
 };
-pub(crate) use semantic::SemanticSiteNumbering;
 pub use semantic::{
     SemanticBindingKind, SemanticBlock, SemanticBuildError, SemanticCatch, SemanticContext,
     SemanticExpression, SemanticExpressionFacts, SemanticExpressionTransform, SemanticFinally,
@@ -94,6 +93,7 @@ pub use semantic::{
     SourceSyntaxSemantics, SourceVariableContext, SsaSemantics, StatementOrigin,
     StringBuilderProtocol, StringBuildingRecovery, ValueSemantics,
 };
+pub(crate) use semantic::{SemanticControlTopology, SemanticSiteNumbering};
 
 // Structuring algorithm
 pub use structure::StructureError;

@@ -103,11 +103,13 @@ impl JavaDecompiler {
         inner: Vec<NestedClassInput>,
     ) -> Result<String, JavaDecompilerError> {
         self.observer.checkpoint()?;
+        let signature_started = std::time::Instant::now();
         let source_signatures = super::signature_inference::SourceSignatureInference::analyze(
             self.type_hierarchy.as_ref(),
             methods,
             &inner,
         );
+        let signature_ms = signature_started.elapsed();
         let methods_started = std::time::Instant::now();
         let (outer_methods, outer_instance) =
             crate::profile_scope!("java_backend.class.outer_methods", {
@@ -139,11 +141,12 @@ impl JavaDecompiler {
         })?;
         if std::env::var_os("DEXDEC_BATCH_STATS").is_some() {
             let render_ms = render_started.elapsed();
-            let total = methods_ms + nested_ms + model_ms + render_ms;
+            let total = signature_ms + methods_ms + nested_ms + model_ms + render_ms;
             if total.as_millis() >= 200 {
                 eprintln!(
-                    "dexdec class {}: methods={:.0}ms nested={:.0}ms model={:.0}ms render={:.0}ms",
+                    "dexdec class {}: signatures={:.0}ms methods={:.0}ms nested={:.0}ms model={:.0}ms render={:.0}ms",
                     class.type_descriptor(),
+                    signature_ms.as_secs_f64() * 1000.0,
                     methods_ms.as_secs_f64() * 1000.0,
                     nested_ms.as_secs_f64() * 1000.0,
                     model_ms.as_secs_f64() * 1000.0,

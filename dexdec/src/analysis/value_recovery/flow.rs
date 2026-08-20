@@ -363,14 +363,16 @@ impl<'ir> ValueFlowGraph<'ir> {
     pub(super) fn build_source(
         root: &'ir SemanticNode,
         bindings: &BTreeSet<SsaVar>,
+        cache: &mut Option<super::source::SourceFlowCache>,
     ) -> Result<Self, ValueRecoveryError> {
-        Self::build_allocated(root, ValueIdentity::Source, bindings)
+        Self::build_allocated(root, ValueIdentity::Source, bindings, cache)
     }
 
     fn build_allocated(
         root: &'ir SemanticNode,
         identity: ValueIdentity,
         bindings: &BTreeSet<SsaVar>,
+        cache: &mut Option<super::source::SourceFlowCache>,
     ) -> Result<Self, ValueRecoveryError> {
         let symbols = crate::profile_scope!(
             "value.graph.control_symbols",
@@ -378,10 +380,27 @@ impl<'ir> ValueFlowGraph<'ir> {
         );
         let logic =
             crate::profile_scope!("value.graph.domain", DomainLogic::new(&symbols.variables));
-        let semantic_flow = crate::profile_scope!(
-            "value.graph.semantic_flow",
-            crate::ir::analysis::SemanticFlowGraph::analyze(root)
-        );
+        let topology = crate::ir::SemanticControlTopology::analyze(root);
+        let sites = crate::ir::SemanticSiteNumbering::fingerprint(root);
+        let semantic_flow = if cache
+            .as_ref()
+            .is_some_and(|cached| cached.topology == topology && cached.sites == sites)
+        {
+            crate::profile_scope!("value.graph.semantic_flow_reuse", {
+                cache.as_ref().expect("checked").flow.clone()
+            })
+        } else {
+            let flow = crate::profile_scope!(
+                "value.graph.semantic_flow",
+                crate::ir::analysis::SemanticFlowGraph::analyze(root)
+            );
+            *cache = Some(super::source::SourceFlowCache {
+                topology,
+                sites,
+                flow: flow.clone(),
+            });
+            flow
+        };
         let graph = Self {
             identity,
             logic,
@@ -968,7 +987,7 @@ mod tests {
             finally: None,
         };
 
-        let graph = ValueFlowGraph::build_source(&root, &BTreeSet::new()).unwrap();
+        let graph = ValueFlowGraph::build_source(&root, &BTreeSet::new(), &mut None).unwrap();
 
         assert!(graph.is_bound(SsaVar::new(7, 0)));
     }
@@ -976,8 +995,12 @@ mod tests {
     #[test]
     fn method_inputs_are_lexical_value_bindings() {
         let binding = SsaVar::new(7, 0);
-        let graph =
-            ValueFlowGraph::build_source(&SemanticNode::Empty, &BTreeSet::from([binding])).unwrap();
+        let graph = ValueFlowGraph::build_source(
+            &SemanticNode::Empty,
+            &BTreeSet::from([binding]),
+            &mut None,
+        )
+        .unwrap();
 
         assert!(graph.is_bound(binding));
     }

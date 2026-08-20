@@ -95,15 +95,19 @@ impl PredicateRegionFormation {
                 else_node: None,
             } = &node
             {
-                let prefix = SemanticNode::sequence(std::mem::take(&mut formed));
-                let (prefix, distributed) = GuardDistribution::apply(prefix, condition, then_node)?;
-                if distributed {
-                    formed.push(prefix);
-                    self.changed = true;
-                    continue;
-                }
-                if !matches!(prefix, SemanticNode::Empty) {
-                    formed.push(prefix);
+                // PathInjector only rewrites the last sequential child. Passing
+                // the whole prefix cloned the growing if-chain on every
+                // candidate (O(n²) completion walks). Apply against the last
+                // node only; a long if-chain stays a flat sequence.
+                if !formed.is_empty() && GuardDistribution::should_try(condition, then_node) {
+                    let last = formed.pop().expect("non-empty prefix");
+                    let (last, distributed) =
+                        GuardDistribution::apply(last, condition, then_node)?;
+                    formed.push(last);
+                    if distributed {
+                        self.changed = true;
+                        continue;
+                    }
                 }
             }
             formed.push(node);

@@ -3,6 +3,8 @@ use std::io;
 
 use std::sync::{Arc, OnceLock, RwLock};
 
+use rayon::prelude::*;
+
 use crate::frontend::{
     AccessInfo, AnalysisDiagnostic, AnalysisLocation, ClassNode, DexFileReader, MethodNode,
     MethodOverrideSemantics, MethodReference,
@@ -707,9 +709,9 @@ impl GenericTypeHierarchy {
             hierarchy: CompositeClassHierarchy::from_loaded(loaded)?,
             method_overloads: Arc::new(MethodOverloadIndex::default()),
         };
-        for owner in owners {
-            hierarchy.ensure_method_overloads(&owner);
-        }
+        owners
+            .into_par_iter()
+            .for_each(|owner| hierarchy.ensure_method_overloads(&owner));
         Ok(hierarchy)
     }
 

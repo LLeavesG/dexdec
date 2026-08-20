@@ -1197,6 +1197,43 @@ impl DexJavaDialect {
         }
     }
 
+    fn array_element_primitive(&self, expression: &SemanticExpression) -> Option<PrimitiveType> {
+        let operation = expression.as_operation()?;
+        if operation.insn_type != InsnType::Aget {
+            return None;
+        }
+        let array = operation.operands().first()?;
+        match self.expression_type(array).ok()? {
+            ArgType::Array(element) => element.as_primitive(),
+            _ => None,
+        }
+    }
+
+    fn numeric_comparison_domain(
+        &self,
+        left: &SemanticExpression,
+        right: &SemanticExpression,
+    ) -> ArgType {
+        let primitives = [
+            self.source_primitive_type(left),
+            Self::intrinsic_primitive_type(left),
+            self.array_element_primitive(left),
+            self.source_primitive_type(right),
+            Self::intrinsic_primitive_type(right),
+            self.array_element_primitive(right),
+        ];
+        if primitives.contains(&Some(PrimitiveType::Double)) {
+            return ArgType::Primitive(PrimitiveType::Double);
+        }
+        if primitives.contains(&Some(PrimitiveType::Float)) {
+            return ArgType::Primitive(PrimitiveType::Float);
+        }
+        if primitives.contains(&Some(PrimitiveType::Long)) {
+            return ArgType::Primitive(PrimitiveType::Long);
+        }
+        ArgType::Primitive(PrimitiveType::Int)
+    }
+
     fn has_intrinsic_numeric_comparison_domain(
         &self,
         left: &SemanticExpression,
@@ -4259,10 +4296,11 @@ impl DexJavaDialect {
             return Ok(comparison);
         }
         if self.has_intrinsic_numeric_comparison_domain(left_arg, right_arg)? {
+            let domain = self.numeric_comparison_domain(left_arg, right_arg);
             return Ok(JavaExpr::Binary {
-                left: Box::new(self.arg(left_arg)?),
+                left: Box::new(self.arg_as(left_arg, &domain)?),
                 op: Self::comparison_operator(op),
-                right: Box::new(self.arg(right_arg)?),
+                right: Box::new(self.arg_as(right_arg, &domain)?),
             });
         }
         let mut left = self.comparison_arg(left_arg, right_arg)?;

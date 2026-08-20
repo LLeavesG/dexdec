@@ -159,18 +159,48 @@ pub(crate) trait GenericTypeProjection: std::fmt::Debug {
 
 #[derive(Debug, Clone, Default)]
 struct JavaTypeErasureIndex {
-    erasures: HashMap<JavaType, ArgType>,
+    classes: HashMap<String, ArgType>,
+    primitives: HashMap<JavaType, ArgType>,
 }
 
 impl JavaTypeErasureIndex {
     fn from_source_types(source_types: &BTreeMap<ArgType, JavaType>) -> Self {
-        let mut erasures = HashMap::with_capacity(source_types.len());
+        let mut classes = HashMap::with_capacity(source_types.len());
+        let mut primitives = HashMap::new();
         for (erased, source) in source_types {
-            if let Some(key) = Self::direct_key(source) {
-                erasures.entry(key).or_insert_with(|| erased.clone());
+            match source {
+                JavaType::Class(class) => {
+                    classes
+                        .entry(Self::class_key(class))
+                        .or_insert_with(|| erased.clone());
+                }
+                JavaType::Primitive(_) => {
+                    primitives
+                        .entry(source.clone())
+                        .or_insert_with(|| erased.clone());
+                }
+                JavaType::Array(_) | JavaType::Variable(_) => {}
             }
         }
-        Self { erasures }
+        Self {
+            classes,
+            primitives,
+        }
+    }
+
+    fn class_key(class: &JavaClassType) -> String {
+        let mut key = String::new();
+        for (index, segment) in class.segments.iter().enumerate() {
+            if index > 0 {
+                key.push('/');
+            }
+            key.push_str(segment.name.as_str());
+        }
+        key
+    }
+
+    fn class_erasure(&self, class: &JavaClassType) -> Option<ArgType> {
+        self.classes.get(&Self::class_key(class)).cloned()
     }
 
     fn erasure_of(
@@ -186,26 +216,8 @@ impl JavaTypeErasureIndex {
                 .get(variable)
                 .cloned()
                 .or_else(|| Some(ArgType::object("java/lang/Object"))),
-            JavaType::Class(_) | JavaType::Primitive(_) => {
-                self.erasures.get(&Self::direct_key(ty)?).cloned()
-            }
-        }
-    }
-
-    fn direct_key(ty: &JavaType) -> Option<JavaType> {
-        match ty {
-            JavaType::Class(class) => Some(JavaType::Class(JavaClassType {
-                segments: class
-                    .segments
-                    .iter()
-                    .map(|segment| JavaClassTypeSegment {
-                        name: segment.name.clone(),
-                        arguments: Vec::new(),
-                    })
-                    .collect(),
-            })),
-            JavaType::Primitive(_) => Some(ty.clone()),
-            JavaType::Variable(_) | JavaType::Array(_) => None,
+            JavaType::Class(class) => self.class_erasure(class),
+            JavaType::Primitive(_) => self.primitives.get(ty).cloned(),
         }
     }
 }
@@ -267,12 +279,7 @@ impl<'a> JavaTypeRelations<'a> {
         match ty {
             JavaType::Array(element) => Some(ArgType::array(self.erasure_of(element)?)),
             JavaType::Class(class) => self
-                .source_types
-                .iter()
-                .find_map(|(erased, source)| {
-                    matches!(source, JavaType::Class(source) if source.name() == class.name())
-                        .then(|| erased.clone())
-                })
+                .class_erasure(class)
                 .or_else(|| {
                     self.hierarchy
                         .and_then(|hierarchy| hierarchy.erasure_of(ty))
@@ -288,6 +295,19 @@ impl<'a> JavaTypeRelations<'a> {
                 .iter()
                 .find_map(|(erased, source)| (source == ty).then(|| erased.clone())),
         }
+    }
+
+    fn class_erasure(&self, class: &JavaClassType) -> Option<ArgType> {
+        if let Some(erased) = self
+            .source_erasures
+            .and_then(|index| index.class_erasure(class))
+        {
+            return Some(erased);
+        }
+        self.source_types.iter().find_map(|(erased, source)| {
+            matches!(source, JavaType::Class(source) if source.name() == class.name())
+                .then(|| erased.clone())
+        })
     }
 
     /// Recover a DEX binary name for a raw class that never entered `source_types`.

@@ -657,6 +657,8 @@ impl DecompilerContext {
                 return Ok(());
             }
         }
+        let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
+        let t0 = std::time::Instant::now();
         let candidates = self
             .reader
             .classes()
@@ -671,16 +673,37 @@ impl DecompilerContext {
             .collect::<Vec<_>>();
         let mut methods = Vec::with_capacity(candidates.len());
         for (owner, method) in candidates {
-            methods.push(self.decode_class_method(&owner, method));
+            methods.push(self.decode_class_method(&owner, method, false));
         }
+        let fo_ms = t0.elapsed();
+        let t1 = std::time::Instant::now();
         let hierarchy = self.type_hierarchy()?;
+        let hier_ms = t1.elapsed();
+        let t2 = std::time::Instant::now();
         let signatures = SourceSignatureInference::analyze(hierarchy.as_ref(), &methods, &[]);
-        let source_abi = Arc::new(JavaSourceAbi::analyze(self.reader.classes(), |method| {
-            (
-                signatures.body_parameter_types(method),
-                signatures.return_type(method),
-            )
-        }));
+        let sig_ms = t2.elapsed();
+        let t3 = std::time::Instant::now();
+        let source_abi = Arc::new(JavaSourceAbi::analyze_with_hierarchy(
+            self.reader.classes(),
+            |method| {
+                (
+                    signatures.body_parameter_types(method),
+                    signatures.return_type(method),
+                )
+            },
+            Some(hierarchy.as_ref()),
+        ));
+        let analyze_ms = t3.elapsed();
+        if stats {
+            eprintln!(
+                "dexdec batch: java_abi_detail fo_decode={:.0}ms hierarchy={:.0}ms signatures={:.0}ms analyze={:.0}ms fo_methods={}",
+                fo_ms.as_secs_f64() * 1000.0,
+                hier_ms.as_secs_f64() * 1000.0,
+                sig_ms.as_secs_f64() * 1000.0,
+                analyze_ms.as_secs_f64() * 1000.0,
+                methods.len(),
+            );
+        }
         let revision = self.reader.loaded_classes_revision();
         self.java_source_abi_cache = Some((revision, Arc::clone(&source_abi)));
         Ok(())
@@ -1035,7 +1058,7 @@ impl DecompilerContext {
             let mut method_models = Vec::new();
             for method in methods {
                 observer.checkpoint()?;
-                method_models.push(self.decode_class_method(class_name, method));
+                method_models.push(self.decode_class_method(class_name, method, !run_termination));
             }
             Ok::<_, DecompileError>(method_models)
         })?;
@@ -1044,7 +1067,7 @@ impl DecompilerContext {
         let mut inner: Vec<NestedClassInput> = Vec::new();
         if include_inner {
             inner = crate::profile_scope!("api.collect_nested_class_inputs", {
-                self.collect_nested_class_inputs(&class_node)
+                self.collect_nested_class_inputs(&class_node, !run_termination)
             })?;
             crate::profile_scope!("api.sort_nested_inputs", sort_nested_inputs(&mut inner));
         }
@@ -1113,6 +1136,7 @@ impl DecompilerContext {
         prepare_kotlin: bool,
     ) -> Result<(), DecompileError> {
         crate::profile_scope!("api.prepare_archive_source_abi", {
+            let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
             if prepare_kotlin {
                 let roots = self
                     .method_irs
@@ -1122,12 +1146,33 @@ impl DecompilerContext {
                 self.set_kotlin_contract_roots(contract_roots(roots.into_iter()));
             }
             if prepare_java {
+                let started = std::time::Instant::now();
                 self.prepare_java_source_abi()?;
+                if stats {
+                    eprintln!(
+                        "dexdec batch: java_abi={:.0}ms",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
             if prepare_kotlin {
+                let started = std::time::Instant::now();
                 self.kotlin_source_abi()?;
+                if stats {
+                    eprintln!(
+                        "dexdec batch: kotlin_abi={:.0}ms",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
             }
+            let started = std::time::Instant::now();
             self.type_hierarchy()?;
+            if stats {
+                eprintln!(
+                    "dexdec batch: hierarchy={:.0}ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             Ok(())
         })
     }
@@ -1328,6 +1373,7 @@ impl DecompilerContext {
         &mut self,
         class_name: &str,
         method: crate::frontend::MethodNode,
+        take: bool,
     ) -> ClassMethodInput {
         let method_name = method.info.name.clone();
         let descriptor = method.info.descriptor();
@@ -1338,12 +1384,20 @@ impl DecompilerContext {
             );
         }
         let cache_key = format!("{}{}", method_name, descriptor);
-        match self
-            .method_irs
-            .get(class_name)
-            .and_then(|class_cache| class_cache.get(&cache_key))
-            .cloned()
-        {
+        let cfg = if take {
+            self.method_irs
+                .get_mut(class_name)
+                .and_then(|class_cache| class_cache.remove(&cache_key))
+        } else {
+            self.method_irs
+                .get(class_name)
+                .and_then(|class_cache| class_cache.get(&cache_key).cloned())
+        };
+        match cfg.or_else(|| {
+            self.method_irs
+                .get(class_name)
+                .and_then(|class_cache| class_cache.get(&cache_key).cloned())
+        }) {
             Some(cfg) => ClassMethodInput::decoded(method, cfg),
             None => ClassMethodInput::failed(
                 method,
@@ -1371,7 +1425,7 @@ impl DecompilerContext {
             .filter(|method| method.code().is_some())
             .cloned()
         {
-            methods.push(self.decode_class_method(class_name, method));
+            methods.push(self.decode_class_method(class_name, method, false));
         }
         Ok(NestedClassInput {
             class,
@@ -1383,6 +1437,7 @@ impl DecompilerContext {
     fn collect_nested_class_inputs(
         &mut self,
         outer: &ClassNode,
+        take: bool,
     ) -> Result<Vec<NestedClassInput>, DecompileError> {
         let root_names = outer
             .inner_class_names()
@@ -1420,7 +1475,7 @@ impl DecompilerContext {
                         .filter(|method| method.code().is_some())
                         .cloned()
                     {
-                        methods.push(self.decode_class_method(&class_name, method));
+                        methods.push(self.decode_class_method(&class_name, method, take));
                     }
                     let child_names = class_node
                         .inner_class_names()

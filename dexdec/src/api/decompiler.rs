@@ -613,6 +613,7 @@ impl Decompiler {
         let t5 = Instant::now();
         let rendered = ready
             .into_par_iter()
+            .with_min_len(1)
             .map(|(index, job)| {
                 let started = Instant::now();
                 let class = job.class.clone();

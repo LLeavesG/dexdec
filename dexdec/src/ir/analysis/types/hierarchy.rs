@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
+use rayon::prelude::*;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubtypeRelation {
     Yes,
@@ -83,9 +85,15 @@ impl ClassHierarchyIndex {
         }
 
         let starts = self.distance_start_names();
-        let mut map = HashMap::with_capacity(starts.len());
-        for start in starts {
-            let distances = self.compute_distances(&start);
+        let computed = starts
+            .into_par_iter()
+            .map(|start| {
+                let distances = self.compute_distances(&start);
+                (start, distances)
+            })
+            .collect::<Vec<_>>();
+        let mut map = HashMap::with_capacity(computed.len());
+        for (start, distances) in computed {
             map.insert(start, distances);
         }
         self.distances = DistanceTable::Frozen(Arc::new(map));
@@ -172,6 +180,11 @@ impl ClassHierarchyIndex {
                 if let Some(distances) = map.get(start) {
                     return Arc::clone(distances);
                 }
+                if !self.owns_start(start) {
+                    if let Some(base) = self.base.as_deref() {
+                        return base.distances(start);
+                    }
+                }
                 self.compute_distances(start)
             }
             DistanceTable::Building(cache) => {
@@ -204,23 +217,15 @@ impl ClassHierarchyIndex {
     }
 
     fn distance_start_names(&self) -> HashSet<String> {
-        let mut starts: HashSet<String> = self
-            .parents
+        self.parents
             .keys()
             .chain(self.reference_types.keys())
             .cloned()
-            .collect();
-        if let Some(base) = self.base.as_deref() {
-            match &base.distances {
-                DistanceTable::Frozen(map) => {
-                    starts.extend(map.keys().cloned());
-                }
-                DistanceTable::Building(_) => {
-                    starts.extend(base.distance_start_names());
-                }
-            }
-        }
-        starts
+            .collect()
+    }
+
+    fn owns_start(&self, class: &str) -> bool {
+        self.parents.contains_key(class) || self.reference_types.contains_key(class)
     }
 
     fn require_building(&self) {
@@ -272,9 +277,22 @@ impl ClassHierarchyIndex {
     }
 }
 
+impl ClassHierarchyIndex {
+    /// True when `expected` is a recorded ancestor of `value`.
+    ///
+    /// A hit is definitive Yes. A miss still has to BFS so incomplete graphs
+    /// can return Unknown instead of No.
+    fn recorded_ancestor(&self, value: &str, expected: &str) -> bool {
+        if value == expected || expected == "java/lang/Object" {
+            return true;
+        }
+        self.distances(value).contains_key(expected)
+    }
+}
+
 impl TypeHierarchy for ClassHierarchyIndex {
     fn subtype_relation(&self, value: &str, expected: &str) -> SubtypeRelation {
-        if value == expected || expected == "java/lang/Object" {
+        if self.recorded_ancestor(value, expected) {
             return SubtypeRelation::Yes;
         }
         let mut visited = BTreeSet::new();
@@ -301,10 +319,10 @@ impl TypeHierarchy for ClassHierarchyIndex {
     }
 
     fn least_common_supertype(&self, left: &str, right: &str) -> Option<String> {
-        if self.is_subtype(left, right) {
+        if self.recorded_ancestor(left, right) {
             return Some(right.to_string());
         }
-        if self.is_subtype(right, left) {
+        if self.recorded_ancestor(right, left) {
             return Some(left.to_string());
         }
         let left_distances = self.distances(left);
@@ -325,8 +343,8 @@ impl TypeHierarchy for ClassHierarchyIndex {
             .filter(|(_, _, candidate)| {
                 !candidates.iter().any(|(_, _, other)| {
                     other != candidate
-                        && self.is_subtype(other, candidate)
-                        && !self.is_subtype(candidate, other)
+                        && self.recorded_ancestor(other, candidate)
+                        && !self.recorded_ancestor(candidate, other)
                 })
             })
             .min()
@@ -426,6 +444,9 @@ mod tests {
             index.least_common_supertype("pkg/Left", "pkg/Right"),
             Some("pkg/Shared".to_string())
         );
+        assert!(index.recorded_ancestor("pkg/Child", "pkg/Parent"));
+        assert!(index.recorded_ancestor("pkg/Child", "java/lang/Object"));
+        assert!(!index.recorded_ancestor("pkg/Orphan", "pkg/Child"));
     }
 
     #[test]
@@ -442,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn layered_freeze_includes_base_keys() {
+    fn layered_freeze_delegates_base_starts() {
         let mut base = ClassHierarchyIndex::default();
         base.add("android/view/View", ["java/lang/Object".to_string()]);
         base.add("java/lang/Object", Vec::<String>::new());
@@ -451,9 +472,22 @@ mod tests {
         index.add("pkg/MyView", ["android/view/View".to_string()]);
         index.freeze_distances();
         let keys = frozen_keys(&index);
-        assert!(keys.contains("android/view/View"));
-        assert!(keys.contains("java/lang/Object"));
         assert!(keys.contains("pkg/MyView"));
+        assert!(
+            !keys.contains("android/view/View"),
+            "APK-layer freeze must not copy platform starts"
+        );
+        assert_eq!(
+            index
+                .distances("android/view/View")
+                .get("java/lang/Object")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            index.least_common_supertype("pkg/MyView", "android/view/View"),
+            Some("android/view/View".to_string())
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::ir::generic_types::{
     ClassSignature, ClassTypeSignature, GenericMethodContract, GenericSignatures, JvmTypeSignature,
     MethodSignature, SignatureSubstitutionError, TypeArgument, TypeParameter, TypeSubstitution,
 };
-use crate::ir::ty::ArgType;
+use crate::ir::ty::{ArgType, MethodDescriptor};
 use crate::platform_symbols::{default_platform_symbols, PlatformClass, PlatformSymbolSet};
 
 #[derive(Debug)]
@@ -678,15 +678,30 @@ impl LoadedClassHierarchy {
 }
 
 type MethodOverloadKey = (String, usize);
-type MethodOverloadSet = BTreeSet<crate::ir::MethodReference>;
+type MethodOverloadSet = Vec<MethodDescriptor>;
 type MethodOverloadsByKey = BTreeMap<MethodOverloadKey, MethodOverloadSet>;
 
 /// Owner → (name, arity) → overloads declared on that owner or a parent.
-/// Values remap `MethodReference.owner` to the query owner so iteration order
-/// matches the previous `BTreeSet` walk.
+/// Sets store descriptors only; lookup remaps `MethodReference.owner` so the
+/// returned order still matches the previous `BTreeSet` walk.
 #[derive(Debug, Default)]
 struct MethodOverloadIndex {
     by_owner: RwLock<BTreeMap<ArgType, MethodOverloadsByKey>>,
+}
+
+fn remap_overloads(
+    owner: &ArgType,
+    name: &str,
+    descriptors: &[MethodDescriptor],
+) -> Vec<crate::ir::MethodReference> {
+    descriptors
+        .iter()
+        .map(|descriptor| crate::ir::MethodReference {
+            owner: owner.clone(),
+            name: name.to_string(),
+            descriptor: descriptor.clone(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -856,20 +871,20 @@ impl GenericTypeHierarchy {
         self.ensure_method_overloads(&method.owner);
         let key = (method.name.clone(), method.descriptor.parameters.len());
         let Ok(index) = self.method_overloads.by_owner.read() else {
-            return self
-                .collect_owner_overloads(&method.owner)
-                .remove(&key)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
+            return remap_overloads(
+                &method.owner,
+                &method.name,
+                self.collect_owner_overloads(&method.owner)
+                    .remove(&key)
+                    .unwrap_or_default()
+                    .as_slice(),
+            );
         };
         index
             .get(&method.owner)
             .and_then(|overloads| overloads.get(&key))
-            .cloned()
+            .map(|descriptors| remap_overloads(&method.owner, &method.name, descriptors))
             .unwrap_or_default()
-            .into_iter()
-            .collect()
     }
 
     fn ensure_method_overloads(&self, owner: &ArgType) {
@@ -945,15 +960,15 @@ impl GenericTypeHierarchy {
             {
                 let arity = candidate.descriptor.parameters.len();
                 overloads
-                    .entry((candidate.name.clone(), arity))
+                    .entry((candidate.name, arity))
                     .or_default()
-                    .insert(crate::ir::MethodReference {
-                        owner: owner.clone(),
-                        name: candidate.name,
-                        descriptor: candidate.descriptor,
-                    });
+                    .push(candidate.descriptor);
             }
             pending.extend(declared.parents);
+        }
+        for descriptors in overloads.values_mut() {
+            descriptors.sort();
+            descriptors.dedup();
         }
         overloads
     }

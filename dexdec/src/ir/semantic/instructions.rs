@@ -1,6 +1,6 @@
 //! Expression transformation across Semantic IR.
 
-use crate::ir::{RegisterArg, SemanticFoldError, SemanticFolder};
+use crate::ir::{InsnNode, InsnType, RegisterArg, SemanticFoldError, SemanticFolder};
 
 use super::{
     SemanticExpression, SemanticNode, SemanticOperation, SemanticPredicate, SemanticStatement,
@@ -116,8 +116,16 @@ impl SemanticInstructions {
     {
         match &mut statement.kind {
             SemanticStatementKind::Instruction(operation) => {
+                let taken = std::mem::replace(
+                    operation,
+                    SemanticOperation::from_parts(
+                        InsnNode::new(InsnType::Nop, 0),
+                        Vec::new(),
+                        None,
+                    ),
+                );
                 let expression = Self::transform_owned_expression(
-                    SemanticExpression::Operation(Box::new(operation.clone())),
+                    SemanticExpression::Operation(Box::new(taken)),
                     transform,
                 )?;
                 let SemanticExpression::Operation(transformed) = expression else {

@@ -158,13 +158,13 @@ pub(crate) trait GenericTypeProjection: std::fmt::Debug {
 }
 
 #[derive(Debug, Clone, Default)]
-struct JavaTypeErasureIndex {
+pub(super) struct JavaTypeErasureIndex {
     classes: HashMap<String, ArgType>,
     primitives: HashMap<JavaType, ArgType>,
 }
 
 impl JavaTypeErasureIndex {
-    fn from_source_types(source_types: &BTreeMap<ArgType, JavaType>) -> Self {
+    pub(super) fn from_source_types(source_types: &BTreeMap<ArgType, JavaType>) -> Self {
         let mut classes = HashMap::with_capacity(source_types.len());
         let mut primitives = HashMap::new();
         for (erased, source) in source_types {
@@ -248,7 +248,7 @@ impl<'a> JavaTypeRelations<'a> {
         }
     }
 
-    fn with_erasure_index(mut self, index: Option<&'a JavaTypeErasureIndex>) -> Self {
+    pub(super) fn with_erasure_index(mut self, index: Option<&'a JavaTypeErasureIndex>) -> Self {
         self.source_erasures = index;
         self
     }
@@ -290,24 +290,35 @@ impl<'a> JavaTypeRelations<'a> {
                 .get(variable)
                 .cloned()
                 .or_else(|| Some(ArgType::object("java/lang/Object"))),
-            JavaType::Primitive(_) => self
-                .source_types
-                .iter()
-                .find_map(|(erased, source)| (source == ty).then(|| erased.clone())),
+            JavaType::Primitive(_) => {
+                if self.source_erasures.is_some() {
+                    None
+                } else {
+                    self.source_types
+                        .iter()
+                        .find_map(|(erased, source)| (source == ty).then(|| erased.clone()))
+                }
+            }
         }
     }
 
     fn class_erasure(&self, class: &JavaClassType) -> Option<ArgType> {
-        if let Some(erased) = self
-            .source_erasures
-            .and_then(|index| index.class_erasure(class))
-        {
-            return Some(erased);
+        if let Some(index) = self.source_erasures {
+            return index.class_erasure(class);
         }
         self.source_types.iter().find_map(|(erased, source)| {
-            matches!(source, JavaType::Class(source) if source.name() == class.name())
+            matches!(source, JavaType::Class(source) if Self::same_class_name(source, class))
                 .then(|| erased.clone())
         })
+    }
+
+    fn erased_class(&self, class: &JavaClassType) -> Option<ArgType> {
+        self.class_erasure(class)
+            .or_else(|| {
+                self.hierarchy
+                    .and_then(|hierarchy| hierarchy.erasure_of(&JavaType::Class(class.clone())))
+            })
+            .or_else(|| Self::synthesized_class_erasure(class))
     }
 
     /// Recover a DEX binary name for a raw class that never entered `source_types`.
@@ -388,49 +399,51 @@ impl<'a> JavaTypeRelations<'a> {
         source: &super::JavaClassType,
         target: &super::JavaClassType,
     ) -> bool {
-        let source = JavaType::Class(source.clone());
-        let target = JavaType::Class(target.clone());
-        if self.erasure_of(&target) == Some(ArgType::object("java/lang/Object")) {
+        let target_erasure = self.erased_class(target);
+        if target_erasure
+            .as_ref()
+            .is_some_and(|ty| ty.as_object() == Some("java/lang/Object"))
+        {
             return true;
         }
-        if let Some(supertype) = self
-            .erasure_of(&source)
-            .and_then(|source| self.direct_supertypes?.get(&source))
-            .filter(|supertype| *supertype != &source)
+        let source_erasure = self.erased_class(source);
+        if let Some(supertype) = source_erasure
+            .as_ref()
+            .and_then(|erased| self.direct_supertypes?.get(erased))
         {
-            if self.is_assignable(supertype, &target) {
+            if !matches!(supertype, JavaType::Class(class) if class == source)
+                && self.class_assignable_from_supertype(supertype, target)
+            {
                 return true;
             }
         }
-        let erased_subtype = self
-            .erasure_of(&source)
-            .zip(self.erasure_of(&target))
+        let erased_subtype = source_erasure
+            .as_ref()
+            .zip(target_erasure.as_ref())
             .is_some_and(|(source, target)| {
                 self.hierarchy
-                    .is_some_and(|hierarchy| hierarchy.is_subtype(&source, &target))
+                    .is_some_and(|hierarchy| hierarchy.is_subtype(source, target))
             });
-        if erased_subtype && Self::is_reifiable_class(&target) {
+        if erased_subtype && Self::class_is_reifiable(target) {
             return true;
         }
-        let comparable = if Self::same_erasure(&source, &target) {
+        let projected;
+        let source = if Self::same_class_name(source, target) {
             source
         } else {
-            let Some(target_erasure) = self.erasure_of(&target) else {
+            let Some(target_erasure) = target_erasure.as_ref() else {
                 return false;
             };
-            let Some(projected) = self
-                .hierarchy
-                .and_then(|hierarchy| hierarchy.project_supertype(&source, &target_erasure))
-            else {
+            let Some(value) = self.hierarchy.and_then(|hierarchy| {
+                hierarchy.project_supertype(&JavaType::Class(source.clone()), target_erasure)
+            }) else {
+                return false;
+            };
+            projected = value;
+            let JavaType::Class(projected) = &projected else {
                 return false;
             };
             projected
-        };
-        let JavaType::Class(source) = comparable else {
-            return false;
-        };
-        let JavaType::Class(target) = target else {
-            unreachable!();
         };
         source.segments.len() == target.segments.len()
             && source
@@ -441,6 +454,17 @@ impl<'a> JavaTypeRelations<'a> {
                     source.name == target.name
                         && self.arguments_are_assignable(&source.arguments, &target.arguments)
                 })
+    }
+
+    fn class_assignable_from_supertype(
+        &self,
+        supertype: &JavaType,
+        target: &super::JavaClassType,
+    ) -> bool {
+        match supertype {
+            JavaType::Class(source) => self.class_is_assignable(source, target),
+            _ => self.is_assignable(supertype, &JavaType::Class(target.clone())),
+        }
     }
 
     fn arguments_are_assignable(
@@ -479,27 +503,27 @@ impl<'a> JavaTypeRelations<'a> {
         }
     }
 
-    fn same_erasure(left: &JavaType, right: &JavaType) -> bool {
-        match (left, right) {
-            (JavaType::Class(left), JavaType::Class(right)) => left.name() == right.name(),
-            (JavaType::Array(left), JavaType::Array(right)) => Self::same_erasure(left, right),
-            (JavaType::Primitive(left), JavaType::Primitive(right)) => left == right,
-            _ => left == right,
-        }
+    fn same_class_name(left: &super::JavaClassType, right: &super::JavaClassType) -> bool {
+        left.segments.len() == right.segments.len()
+            && left
+                .segments
+                .iter()
+                .zip(&right.segments)
+                .all(|(left, right)| left.name == right.name)
     }
 
     fn is_raw(ty: &JavaType) -> bool {
         matches!(ty, JavaType::Class(class) if class.segments.iter().all(|segment| segment.arguments.is_empty()))
     }
 
-    fn is_reifiable_class(ty: &JavaType) -> bool {
-        matches!(ty, JavaType::Class(class) if class.segments.iter().all(|segment| {
+    fn class_is_reifiable(class: &super::JavaClassType) -> bool {
+        class.segments.iter().all(|segment| {
             segment.arguments.is_empty()
                 || segment
                     .arguments
                     .iter()
                     .all(|argument| matches!(argument, JavaTypeArgument::Any))
-        }))
+        })
     }
 
     fn is_array_supertype(ty: &ArgType) -> bool {
@@ -607,7 +631,7 @@ impl<'a> GenericTypeSolver<'a> {
         }
     }
 
-    fn with_erasure_index(mut self, index: Option<Arc<JavaTypeErasureIndex>>) -> Self {
+    pub(super) fn with_erasure_index(mut self, index: Option<Arc<JavaTypeErasureIndex>>) -> Self {
         self.source_erasures = index;
         self
     }
@@ -6036,6 +6060,30 @@ mod tests {
             &class("example/Child", Vec::new()),
             &class("java/lang/Object", Vec::new()),
         ));
+    }
+
+    #[test]
+    fn indexed_class_assignability_matches_linear_scan() {
+        let source_types = test_source_types();
+        let variables = BTreeMap::new();
+        let index = JavaTypeErasureIndex::from_source_types(&source_types);
+        let unindexed = JavaTypeRelations::new(&source_types, &variables, Some(&ParentProjection));
+        let indexed = JavaTypeRelations::new(&source_types, &variables, Some(&ParentProjection))
+            .with_erasure_index(Some(&index));
+        let child = class("example/Child", Vec::new());
+        let parent = class("example/Parent", vec![JavaTypeArgument::Any]);
+        let object = class("java/lang/Object", Vec::new());
+
+        assert_eq!(indexed.erasure_of(&child), unindexed.erasure_of(&child));
+        assert_eq!(indexed.erasure_of(&parent), unindexed.erasure_of(&parent));
+        assert_eq!(
+            indexed.is_assignable(&child, &object),
+            unindexed.is_assignable(&child, &object)
+        );
+        assert_eq!(
+            indexed.is_assignable(&child, &parent),
+            unindexed.is_assignable(&child, &parent)
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::ir::{SemanticFoldError, SemanticFolder, SemanticNode, SemanticSiteId, SemanticVisitor};
+use crate::ir::{SemanticFoldError, SemanticNode, SemanticSiteId, SemanticVisitor};
 
 pub(crate) struct SemanticSiteNumbering {
     next: u64,
@@ -13,53 +13,91 @@ impl SemanticSiteNumbering {
     }
 
     pub(crate) fn assign(root: &mut SemanticNode) -> Result<(), SemanticFoldError> {
-        let body = std::mem::replace(root, SemanticNode::Empty);
-        *root = Self { next: 0 }.fold_node(body)?;
+        Self { next: 0 }.assign_node(root);
         Ok(())
     }
-}
 
-impl SemanticFolder for SemanticSiteNumbering {
-    type Error = SemanticFoldError;
-
-    fn finish_node(&mut self, mut node: SemanticNode) -> Result<SemanticNode, Self::Error> {
-        match &mut node {
+    /// Post-order site assignment matching `SemanticFolder::finish_node`.
+    ///
+    /// Child visit order follows `fold_node`, not the pre-order fingerprint walk.
+    fn assign_node(&mut self, node: &mut SemanticNode) {
+        match node {
+            SemanticNode::Empty => {}
+            SemanticNode::Sequence(children) => {
+                for child in children {
+                    self.assign_node(child);
+                }
+            }
             SemanticNode::BasicBlock(block) => {
                 for statement in &mut block.statements {
                     statement.site = Some(self.next_site());
                 }
             }
+            SemanticNode::If {
+                condition,
+                then_node,
+                else_node,
+            } => {
+                self.assign_node(then_node.as_mut());
+                if let Some(else_node) = else_node {
+                    self.assign_node(else_node.as_mut());
+                }
+                condition.site = Some(self.next_site());
+            }
+            SemanticNode::Loop { test, body, .. } => {
+                self.assign_node(test.setup.as_mut());
+                self.assign_node(body.as_mut());
+                test.condition.site = Some(self.next_site());
+            }
             SemanticNode::For {
                 init,
                 condition,
                 update,
+                body,
                 ..
             } => {
+                self.assign_node(body.as_mut());
                 init.site = Some(self.next_site());
                 condition.site = Some(self.next_site());
                 update.site = Some(self.next_site());
             }
-            SemanticNode::If { condition, .. } => {
-                condition.site = Some(self.next_site());
-            }
-            SemanticNode::Loop { test, .. } => {
-                test.condition.site = Some(self.next_site());
-            }
-            SemanticNode::ForEach { iterable, .. } => {
+            SemanticNode::ForEach { iterable, body, .. } => {
+                self.assign_node(body.as_mut());
                 iterable.site = Some(self.next_site());
             }
-            SemanticNode::Switch { selector, .. } => {
+            SemanticNode::Switch {
+                selector, cases, ..
+            } => {
+                for case in cases {
+                    self.assign_node(&mut case.body);
+                }
                 selector.site = Some(self.next_site());
             }
-            SemanticNode::Synchronized { lock, .. } => {
+            SemanticNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                self.assign_node(body.as_mut());
+                for catch in catches {
+                    self.assign_node(&mut catch.body);
+                }
+                if let Some(finally) = finally {
+                    self.assign_node(finally.body.as_mut());
+                }
+            }
+            SemanticNode::Synchronized { lock, body, .. } => {
+                self.assign_node(body.as_mut());
                 lock.site = Some(self.next_site());
+            }
+            SemanticNode::Label { body, .. } => {
+                self.assign_node(body.as_mut());
             }
             SemanticNode::Leave(leave) => {
                 leave.site = Some(self.next_site());
             }
-            _ => {}
         }
-        Ok(node)
     }
 }
 

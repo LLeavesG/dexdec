@@ -29,8 +29,8 @@ mod input;
 use super::members::JavaMemberNames;
 use super::source_types::{
     invocation_expression_signature, GenericInvocationCompatibility, GenericTypeEvidence,
-    GenericTypeProjection, GenericTypeRelation, GenericTypeSolver, JavaTypeRelations,
-    SourceObjectTypes, SourceTypeFlow,
+    GenericTypeProjection, GenericTypeRelation, GenericTypeSolver, JavaTypeErasureIndex,
+    JavaTypeRelations, SourceObjectTypes, SourceTypeFlow,
 };
 use input::JavaInputVerifier;
 
@@ -214,6 +214,7 @@ pub struct DexJavaDialect {
     this_code_var: Option<u32>,
     types: SourceTypeEnvironment,
     source_types: BTreeMap<ArgType, JavaType>,
+    source_erasures: Arc<JavaTypeErasureIndex>,
     inline_declarations: BTreeSet<SourceVariable>,
     catch_storage: BTreeSet<SourceVariable>,
     name_scope: JavaNameScope,
@@ -341,6 +342,7 @@ impl DexJavaDialect {
                 names: parameter_names.len(),
             });
         }
+        let source_erasures = Arc::new(JavaTypeErasureIndex::from_source_types(&source_types));
         let mut values = Self {
             names: BTreeMap::new(),
             source_names: BTreeMap::new(),
@@ -370,6 +372,7 @@ impl DexJavaDialect {
             this_code_var,
             types: types.clone(),
             source_types,
+            source_erasures,
             inline_declarations: BTreeSet::new(),
             catch_storage: BTreeSet::new(),
             name_scope: JavaNameScope::default(),
@@ -1727,6 +1730,7 @@ impl DexJavaDialect {
                     })
                     .unwrap_or_else(|| {
                         GenericTypeSolver::new(&self.source_types)
+                            .with_erasure_index(Some(Arc::clone(&self.source_erasures)))
                             .with_projection(self.generic_type_projection.as_deref())
                     });
                 let contextual_allocation_type = expected_source_type.and_then(|expected| {
@@ -2094,6 +2098,7 @@ impl DexJavaDialect {
             .map(|contract| self.solver(&contract.owner, &contract.signature.type_parameters))
             .unwrap_or_else(|| {
                 GenericTypeSolver::new(&self.source_types)
+                    .with_erasure_index(Some(Arc::clone(&self.source_erasures)))
                     .with_projection(self.generic_type_projection.as_deref())
             });
         if let Some(contract) = &contract {
@@ -3519,6 +3524,7 @@ impl DexJavaDialect {
             &self.source_type_erasures,
             self.generic_type_projection.as_deref(),
         )
+        .with_erasure_index(Some(self.source_erasures.as_ref()))
         .with_direct_supertypes(Some(self.source_object_types.as_ref()))
         .with_variable_bounds(Some(&self.source_type_bounds))
     }
@@ -3529,6 +3535,7 @@ impl DexJavaDialect {
         parameters: &[TypeParameter],
     ) -> GenericTypeSolver<'a> {
         let solver = GenericTypeSolver::new(&self.source_types)
+            .with_erasure_index(Some(Arc::clone(&self.source_erasures)))
             .with_local_owner_variables(owner)
             .with_inference_variables(parameters)
             .with_lexical_scope(

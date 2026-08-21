@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rayon::prelude::*;
+
 use crate::ir::{
     ArgType, EdgeKind, InsnNode, InsnType, InvokeType, MemberReference, MethodReference, CFG,
 };
@@ -28,7 +30,7 @@ impl MethodTermination {
 
         loop {
             let discovered = methods
-                .iter()
+                .par_iter()
                 .filter_map(|(method, cfg)| {
                     (!may_return.contains(method)
                         && ReturnReachability::new(&members, &may_return).analyze(cfg))

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
     analysis::SsaVar, IfOp, InsnType, RegisterArg, SemanticExpression, SemanticExpressionTransform,
-    SemanticFolder, SemanticInstructions, SemanticNode, SemanticOperation, SemanticPredicate,
+    SemanticInstructions, SemanticNode, SemanticOperation, SemanticPredicate,
     SemanticStatementKind,
 };
 
@@ -99,9 +99,58 @@ impl ValueSchedule {
     }
 
     pub(super) fn apply(mut self, root: &mut SemanticNode) -> Result<bool, ValueRecoveryError> {
-        let body = std::mem::replace(root, SemanticNode::Empty);
-        *root = self.fold_node(body)?;
+        self.apply_tree(root)?;
         Ok(self.changed)
+    }
+
+    fn apply_tree(&mut self, node: &mut SemanticNode) -> Result<(), ValueRecoveryError> {
+        match node {
+            SemanticNode::Empty | SemanticNode::BasicBlock(_) | SemanticNode::Leave(_) => {}
+            SemanticNode::Sequence(children) => {
+                for child in children {
+                    self.apply_tree(child)?;
+                }
+            }
+            SemanticNode::If {
+                then_node,
+                else_node,
+                ..
+            } => {
+                self.apply_tree(then_node.as_mut())?;
+                if let Some(else_node) = else_node {
+                    self.apply_tree(else_node.as_mut())?;
+                }
+            }
+            SemanticNode::Loop { test, body, .. } => {
+                self.apply_tree(test.setup.as_mut())?;
+                self.apply_tree(body.as_mut())?;
+            }
+            SemanticNode::For { body, .. } => self.apply_tree(body.as_mut())?,
+            SemanticNode::ForEach { body, .. } => self.apply_tree(body.as_mut())?,
+            SemanticNode::Switch { cases, .. } => {
+                for case in cases {
+                    self.apply_tree(&mut case.body)?;
+                }
+            }
+            SemanticNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                self.apply_tree(body.as_mut())?;
+                for catch in catches {
+                    self.apply_tree(&mut catch.body)?;
+                }
+                if let Some(finally) = finally {
+                    self.apply_tree(finally.body.as_mut())?;
+                }
+            }
+            SemanticNode::Synchronized { body, .. } | SemanticNode::Label { body, .. } => {
+                self.apply_tree(body.as_mut())?;
+            }
+        }
+        self.apply_node(node)
     }
 
     fn canonicalize(&mut self) -> Result<(), ValueRecoveryError> {
@@ -184,16 +233,16 @@ impl ValueSchedule {
         Ok(())
     }
 
-    fn apply_node(&mut self, mut node: SemanticNode) -> Result<SemanticNode, ValueRecoveryError> {
+    fn apply_node(&mut self, node: &mut SemanticNode) -> Result<(), ValueRecoveryError> {
         let mut substitution = ValueSubstitution {
             replacements: &self.replacements,
             discarded_results: &self.discarded_results,
             identity: self.identity,
             changed: false,
         };
-        SemanticInstructions::transform_node(&mut node, &mut substitution)?;
+        SemanticInstructions::transform_node(node, &mut substitution)?;
         self.changed |= substitution.changed;
-        match &mut node {
+        match node {
             SemanticNode::BasicBlock(block) => {
                 for statement in &mut block.statements {
                     self.apply_statement_site(statement)?;
@@ -226,7 +275,7 @@ impl ValueSchedule {
             }
             _ => {}
         }
-        if let SemanticNode::Leave(leave) = &mut node {
+        if let SemanticNode::Leave(leave) = node {
             if let Some(replacements) = leave
                 .site
                 .and_then(|site| self.site_replacements.get(&UseSite::Leave(site)))
@@ -242,7 +291,7 @@ impl ValueSchedule {
                 }
             }
         }
-        if let SemanticNode::BasicBlock(block) = &mut node {
+        if let SemanticNode::BasicBlock(block) = node {
             let before = block.statements.len();
             block.statements.retain(|statement| {
                 if statement
@@ -258,7 +307,7 @@ impl ValueSchedule {
             });
             self.changed |= block.statements.len() != before;
         }
-        Ok(node)
+        Ok(())
     }
 
     fn apply_statement_site(
@@ -705,14 +754,6 @@ impl ReplacementGraph {
             pending.extend(self.reverse.get(&node).into_iter().flatten().rev().copied());
         }
         component
-    }
-}
-
-impl SemanticFolder for ValueSchedule {
-    type Error = ValueRecoveryError;
-
-    fn finish_node(&mut self, node: SemanticNode) -> Result<SemanticNode, Self::Error> {
-        self.apply_node(node)
     }
 }
 

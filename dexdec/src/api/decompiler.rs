@@ -812,7 +812,8 @@ fn archive_java_parallel_methods() -> bool {
 }
 
 fn archive_java_parallel_methods_from(value: Option<std::ffi::OsString>) -> bool {
-    // Exact "1" is the A/B override; any other value stays serialized.
+    // Nested rayon inside class-level archive jobs oversubscribed the pool
+    // (study wall 85s -> 88s). Exact "1" remains the A/B override.
     value.as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 

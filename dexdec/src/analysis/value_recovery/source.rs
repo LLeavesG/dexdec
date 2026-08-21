@@ -4,6 +4,8 @@
 //! The same control-domain and effect scheduler used for SSA can therefore run
 //! again with source identities, without a second propagation or DCE algorithm.
 
+use std::sync::Arc;
+
 use crate::ir::{
     SemanticControlTopology, SemanticFoldError, SemanticMethod, SemanticSiteNumbering,
     SourceVariableContext,
@@ -22,7 +24,33 @@ use super::{
 pub(super) struct SourceFlowCache {
     pub(super) topology: SemanticControlTopology,
     pub(super) sites: Vec<u64>,
-    pub(super) flow: crate::ir::analysis::SemanticFlowGraph,
+    pub(super) flow: Arc<crate::ir::analysis::SemanticFlowGraph>,
+}
+
+impl SourceFlowCache {
+    pub(super) fn get_or_analyze(
+        cache: &mut Option<Self>,
+        root: &crate::ir::SemanticNode,
+    ) -> Arc<crate::ir::analysis::SemanticFlowGraph> {
+        let topology = SemanticControlTopology::analyze(root);
+        let sites = SemanticSiteNumbering::fingerprint(root);
+        if let Some(cached) = cache.as_ref() {
+            if cached.topology == topology && cached.sites == sites {
+                return crate::profile_scope!("value.graph.semantic_flow_reuse", {
+                    Arc::clone(&cached.flow)
+                });
+            }
+        }
+        let flow = crate::profile_scope!("value.graph.semantic_flow", {
+            Arc::new(crate::ir::analysis::SemanticFlowGraph::analyze(root))
+        });
+        *cache = Some(Self {
+            topology,
+            sites,
+            flow: Arc::clone(&flow),
+        });
+        flow
+    }
 }
 
 pub(super) struct SourceValueRecovery;

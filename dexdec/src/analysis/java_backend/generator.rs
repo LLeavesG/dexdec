@@ -162,61 +162,43 @@ impl JavaDecompiler {
         inputs: Vec<NestedClassInput>,
         source_signatures: &super::signature_inference::SourceSignatureInference<'_>,
     ) -> Result<Vec<JavaClassModel>, JavaDecompilerError> {
-        let root_count = inputs.len();
-        let mut pending = inputs
-            .into_iter()
-            .rev()
-            .map(NestedModelTask::Build)
-            .collect::<Vec<_>>();
-        let mut results = Vec::new();
-        while let Some(task) = pending.pop() {
-            self.observer.checkpoint()?;
-            match task {
-                NestedModelTask::Build(mut input) => {
-                    self.class_stage(input.class.type_descriptor(), "build_nested_class:start");
-                    let (methods, outer_instance) = self.build_class_methods(
-                        &input.class,
-                        &mut input.methods,
-                        source_signatures,
-                    )?;
-                    let child_count = input.nested.len();
-                    pending.push(NestedModelTask::Finish {
-                        class: input.class,
-                        methods,
-                        outer_instance,
-                        child_count,
-                    });
-                    pending.extend(input.nested.into_iter().rev().map(NestedModelTask::Build));
-                }
-                NestedModelTask::Finish {
-                    class,
-                    methods,
-                    outer_instance,
-                    child_count,
-                } => {
-                    let start = results.len().checked_sub(child_count).ok_or(
-                        JavaDecompilerError::MalformedNestedClassStack {
-                            expected: child_count,
-                            actual: results.len(),
-                        },
-                    )?;
-                    let children = results.drain(start..).collect();
-                    self.class_stage(class.type_descriptor(), "build_nested_class:done");
-                    results.push(
-                        JavaClassModel::from_class_node(&class, methods, outer_instance)?
-                            .as_nested_source_member(&class)
-                            .with_nested(children),
-                    );
-                }
-            }
+        self.build_nested_class_forest(inputs, source_signatures)
+    }
+
+    fn build_nested_class_forest(
+        &self,
+        inputs: Vec<NestedClassInput>,
+        source_signatures: &super::signature_inference::SourceSignatureInference<'_>,
+    ) -> Result<Vec<JavaClassModel>, JavaDecompilerError> {
+        if self.parallel_methods && inputs.len() > 1 {
+            inputs
+                .into_par_iter()
+                .map(|input| self.build_nested_class_tree(input, source_signatures))
+                .collect()
+        } else {
+            inputs
+                .into_iter()
+                .map(|input| self.build_nested_class_tree(input, source_signatures))
+                .collect()
         }
-        if results.len() != root_count {
-            return Err(JavaDecompilerError::MalformedNestedClassStack {
-                expected: root_count,
-                actual: results.len(),
-            });
-        }
-        Ok(results)
+    }
+
+    fn build_nested_class_tree(
+        &self,
+        mut input: NestedClassInput,
+        source_signatures: &super::signature_inference::SourceSignatureInference<'_>,
+    ) -> Result<JavaClassModel, JavaDecompilerError> {
+        self.observer.checkpoint()?;
+        self.class_stage(input.class.type_descriptor(), "build_nested_class:start");
+        let (methods, outer_instance) =
+            self.build_class_methods(&input.class, &mut input.methods, source_signatures)?;
+        let children = self.build_nested_class_forest(input.nested, source_signatures)?;
+        self.class_stage(input.class.type_descriptor(), "build_nested_class:done");
+        Ok(
+            JavaClassModel::from_class_node(&input.class, methods, outer_instance)?
+                .as_nested_source_member(&input.class)
+                .with_nested(children),
+        )
     }
 
     fn build_class_methods(
@@ -597,16 +579,6 @@ impl JavaDecompiler {
                 stage,
             });
     }
-}
-
-enum NestedModelTask {
-    Build(NestedClassInput),
-    Finish {
-        class: ClassNode,
-        methods: Vec<JavaMethodModel>,
-        outer_instance: Option<OuterInstanceField>,
-        child_count: usize,
-    },
 }
 
 fn method_model_from_body_analysis(

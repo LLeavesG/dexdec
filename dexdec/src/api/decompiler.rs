@@ -589,8 +589,6 @@ impl Decompiler {
         }
 
         let collect_ms = t4.elapsed();
-        self.context
-            .prepare_archive_source_abi(needs_java, needs_kotlin)?;
         let hierarchy = self.context.type_hierarchy()?;
         if needs_java {
             self.context.prepare_java_source_abi()?;
@@ -817,6 +815,10 @@ fn archive_java_parallel_methods_from(value: Option<std::ffi::OsString>) -> bool
     value.as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
+fn archive_kotlin_parallel_methods() -> bool {
+    archive_java_parallel_methods_from(std::env::var_os("DEXDEC_ARCHIVE_METHOD_PARALLEL"))
+}
+
 fn render_archive_job(
     mut job: ArchiveClassJob,
     java: &JavaDecompilerConfig,
@@ -849,6 +851,7 @@ fn render_archive_job(
             .with_shared_type_hierarchy(Arc::clone(hierarchy))
             .with_source_abi(Arc::clone(kotlin_abi))
             .with_analysis_observer(Arc::clone(observer))
+            .with_parallel_methods(archive_kotlin_parallel_methods())
             .generate_class_with_nested(
                 &job.input.class_node,
                 &mut job.input.methods,
@@ -927,6 +930,16 @@ mod tests {
         let decompiler =
             JavaDecompiler::new(JavaDecompilerConfig::default()).with_parallel_methods(false);
         assert!(!decompiler.parallel_methods());
+    }
+
+    #[test]
+    fn archive_kotlin_jobs_disable_method_parallelism() {
+        assert!(!archive_kotlin_parallel_methods());
+        let decompiler =
+            KotlinDecompiler::new(KotlinDecompilerConfig::default()).with_parallel_methods(false);
+        assert!(!decompiler.parallel_methods());
+        let parallel = KotlinDecompiler::new(KotlinDecompilerConfig::default());
+        assert!(parallel.parallel_methods());
     }
 
     #[test]

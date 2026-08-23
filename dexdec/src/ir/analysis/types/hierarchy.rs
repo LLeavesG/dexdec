@@ -24,6 +24,11 @@ pub trait TypeHierarchy: Send + Sync {
     }
 
     fn least_common_supertype(&self, left: &str, right: &str) -> Option<String>;
+
+    /// Recorded ancestor names of `class` — the closure its subtype queries
+    /// walk — so repeated questions about one owner can be answered by
+    /// membership instead of per-pair traversals.
+    fn ancestor_names(&self, class: &str) -> Vec<String>;
 }
 
 #[derive(Debug)]
@@ -288,6 +293,14 @@ impl ClassHierarchyIndex {
         }
         self.distances(value).contains_key(expected)
     }
+
+    /// Recorded ancestor names of `class` — the same closure its subtype
+    /// queries walk — so repeated questions about one owner can be answered
+    /// by membership instead of per-pair walks. Includes `class` itself and
+    /// the `java/lang/Object` fallback entry.
+    pub fn ancestor_names(&self, class: &str) -> Vec<String> {
+        self.distances(class).keys().cloned().collect()
+    }
 }
 
 impl TypeHierarchy for ClassHierarchyIndex {
@@ -316,6 +329,10 @@ impl TypeHierarchy for ClassHierarchyIndex {
         } else {
             SubtypeRelation::No
         }
+    }
+
+    fn ancestor_names(&self, class: &str) -> Vec<String> {
+        Self::ancestor_names(self, class)
     }
 
     fn least_common_supertype(&self, left: &str, right: &str) -> Option<String> {

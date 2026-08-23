@@ -320,29 +320,28 @@ impl DecompilerContext {
         class_names: impl IntoIterator<Item = &'a str>,
         include_nested: bool,
     ) -> Result<(), DecompileError> {
-        for class_name in class_names {
-            self.reader.load_class(class_name)?;
+        let mut queue = class_names
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::VecDeque<_>>();
+        let mut seen = queue
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        while !queue.is_empty() {
+            let batch = queue.drain(..).collect::<Vec<_>>();
+            self.reader.load_classes(&batch)?;
             if include_nested {
-                self.load_nested_class_types(class_name)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn load_nested_class_types(&mut self, class_name: &str) -> Result<(), DecompileError> {
-        let mut pending = self
-            .reader
-            .get_class(class_name)
-            .map(|class| class.inner_class_names().to_vec())
-            .unwrap_or_default();
-        let mut seen = std::collections::BTreeSet::from([class_name.to_string()]);
-        while let Some(nested) = pending.pop() {
-            if !seen.insert(nested.clone()) {
-                continue;
-            }
-            self.reader.load_class(&nested)?;
-            if let Some(class) = self.reader.get_class(&nested) {
-                pending.extend(class.inner_class_names().iter().cloned());
+                for class_name in batch {
+                    let Some(class) = self.reader.get_class(&class_name) else {
+                        continue;
+                    };
+                    for nested in class.inner_class_names() {
+                        if seen.insert(nested.to_string()) {
+                            queue.push_back(nested.to_string());
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1239,13 +1238,15 @@ impl DecompilerContext {
                     .values()
                     .flat_map(|methods| methods.values()),
             );
-            for cfg in self
-                .method_irs
+            // Each CFG mutates independently, so the application order cannot
+            // matter.
+            self.method_irs
                 .values_mut()
                 .flat_map(|methods| methods.values_mut())
-            {
-                termination.apply(cfg);
-            }
+                .par_bridge()
+                .for_each(|cfg| {
+                    termination.apply(cfg);
+                });
             Ok(())
         })
     }

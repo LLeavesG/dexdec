@@ -471,6 +471,7 @@ impl InheritedMethodAbi {
         owner: &ClassTypeSignature,
         owner_parameters: &[TypeParameter],
         declarations: &BTreeMap<(String, MethodDescriptor), Vec<(ArgType, GenericMethodContract)>>,
+        owner_ancestors: Option<&std::collections::BTreeSet<String>>,
         hierarchy: &crate::analysis::method_override::GenericTypeHierarchy,
         type_index: Option<&dyn TypeHierarchy>,
     ) -> Option<GenericMethodContract> {
@@ -478,8 +479,18 @@ impl InheritedMethodAbi {
             declarations.get(&(reference.name.clone(), reference.descriptor.clone()))?;
         let mut nearest: Option<(&ArgType, &GenericMethodContract)> = None;
         for (candidate_owner, contract) in candidates.iter().filter(|(candidate_owner, _)| {
-            candidate_owner != &reference.owner
-                && Self::owner_is_subtype(&reference.owner, candidate_owner, type_index, hierarchy)
+            if candidate_owner == &reference.owner {
+                return false;
+            }
+            // With a recorded ancestor closure the filter is a membership
+            // test; it answers exactly the subtype questions the per-pair
+            // walk would for this owner.
+            if let Some(ancestors) = owner_ancestors {
+                return candidate_owner
+                    .as_object()
+                    .is_some_and(|name| ancestors.contains(name));
+            }
+            Self::owner_is_subtype(&reference.owner, candidate_owner, type_index, hierarchy)
         }) {
             nearest = match nearest {
                 None => Some((candidate_owner, contract)),
@@ -825,6 +836,14 @@ impl JavaSourceAbi {
         mark("generic_methods", t);
         let t = std::time::Instant::now();
         if let Some(hierarchy) = generic_hierarchy.as_ref() {
+            // Bridge lookup scans candidates sharing the bridge's name and
+            // descriptor. Candidate filtering asks the same "is the bridge's
+            // owner a subtype of this candidate" question for every bridge of
+            // a class, so each owner's recorded ancestor closure is computed
+            // once and reused as a membership set instead of walking the
+            // hierarchy per pair.
+            let mut owner_ancestors =
+                std::collections::BTreeMap::<ArgType, std::collections::BTreeSet<String>>::new();
             for class in &classes {
                 let owner = open_owners
                     .get(class.class_type())
@@ -847,11 +866,26 @@ impl JavaSourceAbi {
                     if generic_methods.contains_key(&reference) {
                         continue;
                     }
+                    let ancestors = type_index.map(|index| {
+                        let ancestors = owner_ancestors
+                            .entry(class.class_type().clone())
+                            .or_insert_with(|| {
+                                class
+                                    .class_type()
+                                    .as_object()
+                                    .map(|name| index.ancestor_names(name))
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .collect()
+                            });
+                        &*ancestors
+                    });
                     if let Some(contract) = InheritedMethodAbi::contract(
                         &reference,
                         &owner,
                         &owner_parameters,
                         &generic_method_declarations,
+                        ancestors,
                         hierarchy,
                         type_index,
                     ) {

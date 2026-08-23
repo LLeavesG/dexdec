@@ -1343,12 +1343,282 @@ impl<'cfg> GapFacts<'cfg> {
     }
 }
 
-struct BridgeSearch {
-    left_blocks: BTreeSet<BlockId>,
-    right_blocks: BTreeSet<BlockId>,
-    outer_blocks: BTreeSet<BlockId>,
+struct BridgeSearch<'e, 'c> {
+    left_blocks: &'e BTreeSet<BlockId>,
+    right_blocks: &'e BTreeSet<BlockId>,
     endpoint_scopes: BTreeSet<u32>,
-    candidates: BTreeSet<BlockId>,
+    candidates: CandidateFilter<'e, 'c>,
+}
+
+/// The half of bridge analysis that only reads the left fragment and the
+/// region slice. Connected-fragment scans evaluate many right partners per
+/// left fragment, so this side is built once per left instead of once per
+/// pair; the values are exactly what recomputing them per pair produced.
+struct BridgeEndpoint<'cfg> {
+    cfg: &'cfg CFG,
+    scope: BTreeSet<u32>,
+    blocks: BTreeSet<BlockId>,
+    handler_signature: Vec<HandlerClauseSignature>,
+    catch_signature: Vec<HandlerClauseSignature>,
+    lexical_parent: Option<u32>,
+    equivalent_scopes: BTreeSet<u32>,
+    exception_boundary: BTreeSet<BlockId>,
+    /// Regions whose handler domains nest inside `exception_boundary`. The
+    /// proof walks every handler block and successor per region, and the pair
+    /// loops re-ask the same question once per partner, so the verdicts are
+    /// settled here instead.
+    nested_contained: BTreeSet<u32>,
+}
+
+/// Memoized per-scan region facts. Every entry is a pure function of the
+/// region slice the index was built from, so a lookup returns exactly what
+/// recomputing it on the fly would — the coalescing scanners just used to
+/// recompute them once per candidate pair, which put bridge analysis in
+/// cubic territory on methods with many try regions.
+struct RegionIndex<'a> {
+    regions: &'a [TryRegion],
+    parents: BTreeMap<u32, Option<u32>>,
+    /// Owner id -> ids of the owner itself plus every region whose strict
+    /// parent chain contains it (the old `scope_regions`).
+    scopes: BTreeMap<u32, BTreeSet<u32>>,
+    handler_signatures: BTreeMap<u32, Vec<HandlerClauseSignature>>,
+    catch_signatures: BTreeMap<u32, Vec<HandlerClauseSignature>>,
+    parents_outside_cleanup_envelopes: BTreeMap<u32, Option<u32>>,
+    blocks: BTreeMap<u32, BTreeSet<BlockId>>,
+    /// Owner id -> protected blocks of the owner plus every descendant (the
+    /// block-level image of `scopes`).
+    scope_block_sets: BTreeMap<u32, BTreeSet<BlockId>>,
+    /// Block -> ids of the regions whose protected bodies contain it. DEX
+    /// ranges may repeat around nested tries, so one block can have several
+    /// owners; corridor predicates read ownership from here instead of
+    /// materializing whole exclusion sets per candidate pair.
+    block_owners: BTreeMap<BlockId, Vec<u32>>,
+    /// Every handler body block in the slice. Bridge analysis excludes these
+    /// from candidate corridors regardless of scope ownership, so the union is
+    /// built once instead of being re-inserted per pair.
+    handler_blocks: BTreeSet<BlockId>,
+}
+
+impl<'a> RegionIndex<'a> {
+    fn of(regions: &'a [TryRegion]) -> Self {
+        let parents = regions
+            .iter()
+            .map(|region| (region.id, region.parent))
+            .collect::<BTreeMap<_, _>>();
+        let mut scopes = regions
+            .iter()
+            .map(|region| (region.id, BTreeSet::from([region.id])))
+            .collect::<BTreeMap<_, _>>();
+        for region in regions {
+            // Register `region` under every strict ancestor so scope lookups
+            // read off the same descendant sets the parent-chain walks found.
+            let mut visited = BTreeSet::new();
+            let mut current = region.parent;
+            while let Some(id) = current {
+                if !visited.insert(id) {
+                    break;
+                }
+                if let Some(scope) = scopes.get_mut(&id) {
+                    scope.insert(region.id);
+                }
+                current = parents.get(&id).copied().flatten();
+            }
+        }
+        let handler_signatures = regions
+            .iter()
+            .map(|region| (region.id, Self::handler_signature(region)))
+            .collect::<BTreeMap<_, _>>();
+        let catch_signatures = regions
+            .iter()
+            .map(|region| (region.id, Self::catch_signature(region)))
+            .collect::<BTreeMap<_, _>>();
+        let parents_outside_cleanup_envelopes = regions
+            .iter()
+            .map(|region| {
+                (
+                    region.id,
+                    Self::parent_outside_cleanup_envelopes_with(region.parent, &parents, regions),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let blocks = regions
+            .iter()
+            .map(|region| {
+                (
+                    region.id,
+                    region.blocks.iter().copied().collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        // Same registration walk as `scopes`, one level down: every region
+        // contributes its blocks to itself and to each strict ancestor, so the
+        // entry for an owner reads off exactly `scope_blocks(scope(owner))`.
+        let mut scope_block_sets = blocks.clone();
+        for region in regions {
+            let mut visited = BTreeSet::new();
+            let mut current = region.parent;
+            while let Some(id) = current {
+                if !visited.insert(id) {
+                    break;
+                }
+                if let Some(ancestor_blocks) = scope_block_sets.get_mut(&id) {
+                    ancestor_blocks.extend(region.blocks.iter().copied());
+                }
+                current = parents.get(&id).copied().flatten();
+            }
+        }
+        let handler_blocks = regions
+            .iter()
+            .flat_map(|region| &region.handlers)
+            .flat_map(|handler| handler.blocks.iter().copied())
+            .collect();
+        let mut block_owners = BTreeMap::<BlockId, Vec<u32>>::new();
+        for region in regions {
+            for block in &region.blocks {
+                block_owners.entry(*block).or_default().push(region.id);
+            }
+        }
+        Self {
+            regions,
+            parents,
+            scopes,
+            handler_signatures,
+            catch_signatures,
+            parents_outside_cleanup_envelopes,
+            blocks,
+            scope_block_sets,
+            block_owners,
+            handler_blocks,
+        }
+    }
+
+    fn region(&self, id: u32) -> Option<&'a TryRegion> {
+        self.regions.iter().find(|region| region.id == id)
+    }
+
+    fn scope(&self, owner: u32) -> &BTreeSet<u32> {
+        self.scopes
+            .get(&owner)
+            .unwrap_or_else(|| unreachable!("scope lookups only name known regions"))
+    }
+
+    fn scope_blocks(&self, scope: &BTreeSet<u32>) -> BTreeSet<BlockId> {
+        scope
+            .iter()
+            .filter_map(|id| self.blocks.get(id))
+            .flat_map(|blocks| blocks.iter().copied())
+            .collect()
+    }
+
+    /// The protected blocks of `owner` plus every descendant scope, identical
+    /// to `scope_blocks(scope(owner))`; see `scope_block_sets`.
+    fn region_scope_blocks(&self, owner: u32) -> &BTreeSet<BlockId> {
+        self.scope_block_sets
+            .get(&owner)
+            .unwrap_or_else(|| unreachable!("block lookups only name known regions"))
+    }
+
+    fn enclosing_regions(&self, left: &TryRegion, right: &TryRegion) -> BTreeSet<u32> {
+        let mut enclosing = BTreeSet::new();
+        let mut pending = left
+            .parent
+            .into_iter()
+            .chain(right.parent)
+            .collect::<Vec<_>>();
+        while let Some(region) = pending.pop() {
+            if !enclosing.insert(region) {
+                continue;
+            }
+            pending.extend(self.parents.get(&region).copied().flatten());
+        }
+        let start = left.start_offset.min(right.start_offset);
+        let end = left.end_offset.max(right.end_offset);
+        enclosing.extend(self.regions.iter().filter_map(|region| {
+            let strictly_contains = region.start_offset <= start
+                && end <= region.end_offset
+                && (region.start_offset < start || end < region.end_offset);
+            (region.id != left.id && region.id != right.id && strictly_contains).then_some(region.id)
+        }));
+        enclosing
+    }
+
+    fn handler_signature_of(&self, id: u32) -> &Vec<HandlerClauseSignature> {
+        &self.handler_signatures[&id]
+    }
+
+    fn catch_signature_of(&self, id: u32) -> &Vec<HandlerClauseSignature> {
+        &self.catch_signatures[&id]
+    }
+
+    /// Walks the parent chain through cleanup envelopes, mirroring the walk
+    /// that stops at missing owners or at the first catching ancestor.
+    fn parent_outside_cleanup_envelopes_with(
+        start: Option<u32>,
+        parents: &BTreeMap<u32, Option<u32>>,
+        regions: &[TryRegion],
+    ) -> Option<u32> {
+        let mut parent = start;
+        let mut visited = BTreeSet::new();
+        while let Some(parent_id) = parent {
+            if !visited.insert(parent_id) {
+                break;
+            }
+            let Some(owner) = regions.iter().find(|candidate| candidate.id == parent_id) else {
+                break;
+            };
+            if owner.handlers.is_empty()
+                || owner
+                    .handlers
+                    .iter()
+                    .any(|handler| handler.kind == HandlerKind::Catch)
+            {
+                break;
+            }
+            parent = parents.get(&parent_id).copied().flatten();
+        }
+        parent
+    }
+
+    fn handler_signature(region: &TryRegion) -> Vec<HandlerClauseSignature> {
+        region
+            .handlers
+            .iter()
+            .map(|handler| HandlerClauseSignature {
+                catch_type: handler.catch_type.clone(),
+                kind: handler.kind,
+                continuation: handler.canonical_entry,
+            })
+            .collect()
+    }
+
+    fn catch_signature(region: &TryRegion) -> Vec<HandlerClauseSignature> {
+        let mut signature = region
+            .handlers
+            .iter()
+            .filter(|handler| handler.kind == HandlerKind::Catch)
+            .map(|handler| HandlerClauseSignature {
+                catch_type: handler.catch_type.clone(),
+                kind: handler.kind,
+                continuation: handler.canonical_entry,
+            })
+            .collect::<Vec<_>>();
+        signature.sort_unstable();
+        signature
+    }
+}
+
+/// Membership test for corridor walks. A plain set is the simple universe;
+/// the coalescing scanners instead hand the walks a predicate that reads block
+/// ownership from the region index, so no per-pair candidate set has to be
+/// materialized before walking.
+trait CandidateUniverse {
+    fn includes(&self, block: BlockId) -> bool;
+}
+
+impl CandidateUniverse for BTreeSet<BlockId> {
+    fn includes(&self, block: BlockId) -> bool {
+        self.contains(&block)
+    }
 }
 
 struct NormalPathClosure<'cfg> {
@@ -1365,7 +1635,7 @@ impl<'cfg> NormalPathClosure<'cfg> {
         &self,
         sources: &BTreeSet<BlockId>,
         targets: &BTreeSet<BlockId>,
-        candidates: &BTreeSet<BlockId>,
+        candidates: &impl CandidateUniverse,
     ) -> Option<BTreeSet<BlockId>> {
         self.between_from(sources, targets, candidates, std::iter::empty())
     }
@@ -1374,7 +1644,7 @@ impl<'cfg> NormalPathClosure<'cfg> {
         &self,
         sources: &BTreeSet<BlockId>,
         targets: &BTreeSet<BlockId>,
-        candidates: &BTreeSet<BlockId>,
+        candidates: &impl CandidateUniverse,
     ) -> bool {
         let mut visited = BTreeSet::new();
         let mut pending = sources.iter().copied().collect::<Vec<_>>();
@@ -1385,7 +1655,7 @@ impl<'cfg> NormalPathClosure<'cfg> {
             if targets.contains(&block) {
                 return true;
             }
-            if !sources.contains(&block) && !candidates.contains(&block) {
+            if !sources.contains(&block) && !candidates.includes(block) {
                 continue;
             }
             pending.extend(self.cfg.normal_successors(block));
@@ -1397,13 +1667,13 @@ impl<'cfg> NormalPathClosure<'cfg> {
         &self,
         sources: &BTreeSet<BlockId>,
         targets: &BTreeSet<BlockId>,
-        candidates: &BTreeSet<BlockId>,
+        candidates: &impl CandidateUniverse,
     ) -> Option<BTreeSet<BlockId>> {
         let exception_entries = sources
             .iter()
             .flat_map(|source| self.cfg.successors_with_kind(*source))
             .filter_map(|(target, kind)| kind.is_exception().then_some(*target))
-            .filter(|target| targets.contains(target) || candidates.contains(target));
+            .filter(|target| targets.contains(target) || candidates.includes(*target));
         self.between_from(sources, targets, candidates, exception_entries)
     }
 
@@ -1411,7 +1681,7 @@ impl<'cfg> NormalPathClosure<'cfg> {
         &self,
         sources: &BTreeSet<BlockId>,
         targets: &BTreeSet<BlockId>,
-        candidates: &BTreeSet<BlockId>,
+        candidates: &impl CandidateUniverse,
         extra_entries: impl IntoIterator<Item = BlockId>,
     ) -> Option<BTreeSet<BlockId>> {
         let mut visited = BTreeSet::new();
@@ -1430,10 +1700,10 @@ impl<'cfg> NormalPathClosure<'cfg> {
                 reaches_target = true;
                 continue;
             }
-            if !sources.contains(&block) && !candidates.contains(&block) {
+            if !sources.contains(&block) && !candidates.includes(block) {
                 continue;
             }
-            if candidates.contains(&block) {
+            if candidates.includes(block) {
                 forward.insert(block);
             }
             pending.extend(self.cfg.normal_successors(block));
@@ -1449,10 +1719,10 @@ impl<'cfg> NormalPathClosure<'cfg> {
             if !visited.insert(block) {
                 continue;
             }
-            if !targets.contains(&block) && !candidates.contains(&block) {
+            if !targets.contains(&block) && !candidates.includes(block) {
                 continue;
             }
-            if candidates.contains(&block) {
+            if candidates.includes(block) {
                 backward.insert(block);
             }
             pending.extend(self.predecessors.get(&block).into_iter().flatten().copied());
@@ -1463,7 +1733,7 @@ impl<'cfg> NormalPathClosure<'cfg> {
     fn reentries(
         &self,
         protected: &BTreeSet<BlockId>,
-        candidates: &BTreeSet<BlockId>,
+        candidates: &impl CandidateUniverse,
     ) -> BTreeSet<BlockId> {
         let mut visited = BTreeSet::new();
         let mut forward = BTreeSet::new();
@@ -1472,7 +1742,7 @@ impl<'cfg> NormalPathClosure<'cfg> {
             .flat_map(|block| self.cfg.normal_successors(*block))
             .collect::<Vec<_>>();
         while let Some(block) = pending.pop() {
-            if protected.contains(&block) || !candidates.contains(&block) || !visited.insert(block)
+            if protected.contains(&block) || !candidates.includes(block) || !visited.insert(block)
             {
                 continue;
             }
@@ -1487,7 +1757,7 @@ impl<'cfg> NormalPathClosure<'cfg> {
             .flat_map(|block| self.predecessors.get(block).into_iter().flatten().copied())
             .collect::<Vec<_>>();
         while let Some(block) = pending.pop() {
-            if protected.contains(&block) || !candidates.contains(&block) || !visited.insert(block)
+            if protected.contains(&block) || !candidates.includes(block) || !visited.insert(block)
             {
                 continue;
             }
@@ -1517,14 +1787,14 @@ impl<'cfg> ExceptionalPathClosure<'cfg> {
         &self,
         sources: &BTreeSet<BlockId>,
         targets: &BTreeSet<BlockId>,
-        candidates: &BTreeSet<BlockId>,
+        candidates: &impl CandidateUniverse,
+        predecessors: &BTreeMap<BlockId, Vec<BlockId>>,
     ) -> Option<BTreeSet<BlockId>> {
-        let allowed = sources
-            .iter()
-            .chain(targets)
-            .chain(candidates)
-            .copied()
-            .collect::<BTreeSet<_>>();
+        // `allowed` in the set formulation was sources ∪ targets ∪ candidates;
+        // both walks gate expansion on that union inline here.
+        let allowed = |block: BlockId| {
+            sources.contains(&block) || targets.contains(&block) || candidates.includes(block)
+        };
         let mut visited = BTreeSet::<(BlockId, bool)>::new();
         let mut pending = sources
             .iter()
@@ -1540,14 +1810,14 @@ impl<'cfg> ExceptionalPathClosure<'cfg> {
                 reaches_target_exceptionally |= crossed_exception;
                 continue;
             }
-            if !sources.contains(&block) && !candidates.contains(&block) {
+            if !sources.contains(&block) && !candidates.includes(block) {
                 continue;
             }
             pending.extend(
                 self.cfg
                     .successors_with_kind(block)
                     .iter()
-                    .filter(|(target, _)| allowed.contains(target))
+                    .filter(|(target, _)| allowed(*target))
                     .map(|(target, kind)| (*target, crossed_exception || kind.is_exception())),
             );
         }
@@ -1555,7 +1825,6 @@ impl<'cfg> ExceptionalPathClosure<'cfg> {
             return None;
         }
 
-        let predecessors = self.cfg.predecessor_snapshot();
         let mut backward = BTreeSet::new();
         let mut pending = targets.iter().copied().collect::<Vec<_>>();
         while let Some(block) = pending.pop() {
@@ -1567,15 +1836,18 @@ impl<'cfg> ExceptionalPathClosure<'cfg> {
                     .get(&block)
                     .into_iter()
                     .flatten()
-                    .filter(|predecessor| allowed.contains(predecessor))
+                    .filter(|predecessor| allowed(**predecessor))
                     .copied(),
             );
         }
 
-        let corridor = candidates
+        // Every corridor block is backward-reachable and forward-visited, so
+        // scanning the (small) backward set answers the same intersection the
+        // old full-candidate scan produced.
+        let corridor = backward
             .iter()
             .filter(|block| {
-                backward.contains(block)
+                candidates.includes(**block)
                     && (visited.contains(&(**block, false)) || visited.contains(&(**block, true)))
             })
             .copied()
@@ -1601,6 +1873,67 @@ struct ExceptionScopeCoalescing<'cfg> {
     cfg: &'cfg CFG,
     predecessors: &'cfg BTreeMap<BlockId, Vec<BlockId>>,
     throwing_blocks: BTreeSet<BlockId>,
+    /// Full predecessor view (exception dispatch included) for exceptional
+    /// corridor walks. The CFG is immutable while coalescing runs, so one lazy
+    /// snapshot serves every query instead of rescanning the edge table each
+    /// time a corridor reaches its backward phase.
+    all_predecessors: std::cell::OnceCell<BTreeMap<BlockId, Vec<BlockId>>>,
+}
+
+/// Predicate form of bridge-search candidates. A block is occupied exactly
+/// when some region outside the excluded scopes protects it (or a handler
+/// owns it), which the owner lists answer directly; transparent coverage
+/// reads off the same lists against the transparent scopes. The two scope
+/// lists are tiny (region ids) and vary per pair, so they are owned. `'e`
+/// names index/endpoint data, `'c` the coalescing-owned throw facts.
+struct CandidateFilter<'e, 'c> {
+    owners: &'e BTreeMap<BlockId, Vec<u32>>,
+    excluded_scopes: BTreeSet<u32>,
+    transparent_scopes: BTreeSet<u32>,
+    handler_blocks: &'e BTreeSet<BlockId>,
+    throwing_blocks: &'c BTreeSet<BlockId>,
+    left_blocks: &'e BTreeSet<BlockId>,
+    right_blocks: &'e BTreeSet<BlockId>,
+}
+
+impl CandidateUniverse for CandidateFilter<'_, '_> {
+    fn includes(&self, block: BlockId) -> bool {
+        let owners = self
+            .owners
+            .get(&block)
+            .map(|owners| owners.as_slice())
+            .unwrap_or_default();
+        !self.left_blocks.contains(&block)
+            && !self.right_blocks.contains(&block)
+            && !self.handler_blocks.contains(&block)
+            && owners
+                .iter()
+                .all(|owner| self.excluded_scopes.contains(owner))
+            && (owners
+                .iter()
+                .any(|owner| self.transparent_scopes.contains(owner))
+                || !self.throwing_blocks.contains(&block))
+    }
+}
+
+/// Predicate form of the exceptional-corridor universe: every block some
+/// region protects or some handler owns, minus the endpoints and the
+/// endpoint scopes' own handlers.
+struct CorridorFilter<'a> {
+    owners: &'a BTreeMap<BlockId, Vec<u32>>,
+    handler_blocks: &'a BTreeSet<BlockId>,
+    endpoint_handlers: &'a BTreeSet<BlockId>,
+    sources: &'a BTreeSet<BlockId>,
+    targets: &'a BTreeSet<BlockId>,
+}
+
+impl CandidateUniverse for CorridorFilter<'_> {
+    fn includes(&self, block: BlockId) -> bool {
+        !self.sources.contains(&block)
+            && !self.targets.contains(&block)
+            && !self.endpoint_handlers.contains(&block)
+            && (self.owners.contains_key(&block) || self.handler_blocks.contains(&block))
+    }
 }
 
 /// Proves that a protected scope is lexically nested in a fragmented outer
@@ -1746,7 +2079,8 @@ impl<'cfg> ExceptionScopeNormalization<'cfg> {
             regions = ExceptionScopeNesting::new(self.cfg)
                 .apply(regions)?
                 .without_empty_scopes();
-            if ExceptionScopeLayout::of(&regions) == before {
+            let after = ExceptionScopeLayout::of(&regions);
+            if after == before {
                 return Ok(regions);
             }
         }
@@ -1785,6 +2119,7 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
             cfg,
             predecessors,
             throwing_blocks,
+            all_predecessors: std::cell::OnceCell::new(),
         }
     }
 
@@ -1792,6 +2127,9 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
         &self,
         mut regions: Vec<TryRegion>,
     ) -> Result<Vec<TryRegion>, ExceptionInvariantError> {
+        // One merge per rescan: each merge rewires the region forest, and the
+        // scanners' priority order decides which rewrite applies next, so the
+        // sequence of relations is part of the observable output.
         while let Some(relation) = self.relation(&regions) {
             self.merge(&mut regions, relation)?;
         }
@@ -1886,13 +2224,14 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
     }
 
     fn connected_fragments(&self, regions: &[TryRegion]) -> Option<(u32, u32)> {
+        let index = RegionIndex::of(regions);
         let signatures = regions
             .iter()
-            .map(|region| Self::effective_handler_signature(region, regions))
+            .map(|region| Self::effective_handler_signature(region, &index))
             .collect::<Vec<_>>();
         let lexical_parents = regions
             .iter()
-            .map(|region| Self::parent_outside_cleanup_envelopes(region, regions))
+            .map(|region| index.parents_outside_cleanup_envelopes[&region.id])
             .collect::<Vec<_>>();
         let mut groups = BTreeMap::<&[HandlerClauseSignature], Vec<usize>>::new();
         for (index, signature) in signatures.iter().enumerate() {
@@ -1903,20 +2242,26 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
         }
         let mut candidates = Vec::new();
         for group in groups.values() {
+            if group.len() < 2 {
+                // A single-member group has no pair to evaluate; skipping also
+                // avoids building an unused endpoint below.
+                continue;
+            }
             for &left_index in group {
+                let left = &regions[left_index];
+                let left_endpoint = self.bridge_endpoint(left, &index);
                 for &right_index in group {
                     if left_index == right_index {
                         continue;
                     }
-                    let left = &regions[left_index];
                     let right = &regions[right_index];
                     let ordered = left.start_offset <= right.start_offset;
                     let siblings = lexical_parents[left_index] == lexical_parents[right_index];
-                    let overlaps = left.blocks.iter().any(|block| right.blocks.contains(block));
+                    let overlaps = !index.blocks[&left.id].is_disjoint(&index.blocks[&right.id]);
                     if !(siblings && (ordered || overlaps)) {
                         continue;
                     }
-                    if self.has_transparent_bridge(left, right, regions) {
+                    if self.has_transparent_bridge(&left_endpoint, left, right, &index) {
                         candidates.push((
                             usize::from(left.parent != right.parent),
                             left.start_offset,
@@ -2012,6 +2357,7 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
     /// Proves that two handler fragments are the normal and exceptional
     /// completions of one cleanup scope.
     fn cleanup_alternatives(&self, regions: &[TryRegion]) -> Option<CleanupAlternativeScope> {
+        let index = RegionIndex::of(regions);
         for cleanup in regions {
             let rethrows = cleanup
                 .handlers
@@ -2028,14 +2374,13 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
                 .filter(|candidate| candidate.id != cleanup.id)
                 .filter(|candidate| candidate.parent == cleanup.parent)
                 .filter(|candidate| {
-                    let scope = Self::scope_regions(candidate.id, regions);
-                    rethrows.is_subset(&Self::scope_blocks(&scope, regions))
+                    rethrows.is_subset(&index.scope_blocks(index.scope(candidate.id)))
                 })
                 .collect::<Vec<_>>();
             exceptional.sort_by_key(|candidate| (candidate.blocks.len(), candidate.start_offset));
 
             for exceptional in exceptional {
-                let signature = Self::handler_signature(exceptional);
+                let signature = index.handler_signature_of(exceptional.id).clone();
                 if signature.is_empty() {
                     continue;
                 }
@@ -2045,10 +2390,18 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
                         candidate.id != cleanup.id && candidate.id != exceptional.id
                     })
                     .filter(|candidate| candidate.parent == cleanup.parent)
-                    .filter(|candidate| Self::handler_signature(candidate) == signature)
+                    .filter(|candidate| index.handler_signature_of(candidate.id) == &signature)
                     .filter(|candidate| candidate.end_offset <= exceptional.start_offset)
-                    .filter(|candidate| self.has_transparent_bridge(cleanup, candidate, regions))
                     .collect::<Vec<_>>();
+                if normal.is_empty() {
+                    continue;
+                }
+                // Bridge analysis reads the cleanup fragment once per
+                // candidate, so its endpoint is hoisted out of the scan.
+                let cleanup_endpoint = self.bridge_endpoint(cleanup, &index);
+                normal.retain(|candidate| {
+                    self.has_transparent_bridge(&cleanup_endpoint, cleanup, candidate, &index)
+                });
                 normal.sort_by_key(|candidate| std::cmp::Reverse(candidate.end_offset));
                 if let Some(normal) = normal.first() {
                     return Some(CleanupAlternativeScope {
@@ -2160,7 +2513,7 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
 
     fn effective_handler_signature(
         region: &TryRegion,
-        regions: &[TryRegion],
+        index: &RegionIndex,
     ) -> Vec<HandlerClauseSignature> {
         let mut signature = Self::handler_signature(region);
         let mut parent = region.parent;
@@ -2169,7 +2522,7 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
             if !visited.insert(parent_id) {
                 break;
             }
-            let Some(owner) = regions.iter().find(|candidate| candidate.id == parent_id) else {
+            let Some(owner) = index.region(parent_id) else {
                 break;
             };
             if owner.handlers.is_empty()
@@ -2228,26 +2581,35 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
 
     fn has_transparent_bridge(
         &self,
+        left_endpoint: &BridgeEndpoint,
         left: &TryRegion,
         right: &TryRegion,
-        regions: &[TryRegion],
+        index: &RegionIndex,
     ) -> bool {
-        let search = self.bridge_search(left, right, regions);
-        if !search.left_blocks.is_disjoint(&search.right_blocks) {
+        // Overlapping protected bodies already imply overlapping lexical
+        // scopes, and overlap takes the reentry corridor, which always yields
+        // `Some`. Checking the region's own blocks first skips the full search
+        // for that case; every other pair runs the original analysis below.
+        if !index.blocks[&left.id].is_disjoint(&index.blocks[&right.id]) {
+            return true;
+        }
+        let search = self.bridge_search(left_endpoint, left, right, index);
+        if !search.left_blocks.is_disjoint(search.right_blocks) {
             // Overlapping ranges take the reentry corridor, which always
             // yields `Some` even when that corridor is empty.
             return true;
         }
         NormalPathClosure::new(self.cfg, self.predecessors).reaches(
-            &search.left_blocks,
-            &search.right_blocks,
+            search.left_blocks,
+            search.right_blocks,
             &search.candidates,
         ) || self
             .through_exception_scopes(
-                &search.left_blocks,
-                &search.right_blocks,
+                search.left_blocks,
+                search.right_blocks,
                 &search.endpoint_scopes,
-                regions,
+                index.regions,
+                index,
             )
             .is_some()
     }
@@ -2256,27 +2618,29 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
     /// with the same handler clauses. DEX commonly leaves argument moves
     /// outside try items; including those blocks in the source try does not
     /// alter its exceptional behavior.
-    fn transparent_bridge(
+    fn transparent_bridge<'a>(
         &self,
+        left_endpoint: &'a BridgeEndpoint,
         left: &TryRegion,
         right: &TryRegion,
-        regions: &[TryRegion],
+        index: &'a RegionIndex,
     ) -> Option<BTreeSet<BlockId>> {
-        let search = self.bridge_search(left, right, regions);
+        let search = self.bridge_search(left_endpoint, left, right, index);
         let closure = NormalPathClosure::new(self.cfg, self.predecessors);
-        if search.left_blocks.is_disjoint(&search.right_blocks) {
+        if search.left_blocks.is_disjoint(search.right_blocks) {
             closure
                 .between(
-                    &search.left_blocks,
-                    &search.right_blocks,
+                    search.left_blocks,
+                    search.right_blocks,
                     &search.candidates,
                 )
                 .or_else(|| {
                     self.through_exception_scopes(
-                        &search.left_blocks,
-                        &search.right_blocks,
+                        search.left_blocks,
+                        search.right_blocks,
                         &search.endpoint_scopes,
-                        regions,
+                        index.regions,
+                        index,
                     )
                 })
         } else {
@@ -2285,48 +2649,33 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
             // the normal-flow corridor that leaves and re-enters the protected
             // union, including nested protected domains whose handlers are
             // already covered by that union.
-            Some(closure.reentries(&search.outer_blocks, &search.candidates))
+            let outer_blocks = search.left_blocks | search.right_blocks;
+            Some(closure.reentries(&outer_blocks, &search.candidates))
         }
     }
 
-    fn bridge_search(
-        &self,
-        left: &TryRegion,
-        right: &TryRegion,
-        regions: &[TryRegion],
-    ) -> BridgeSearch {
+    /// Builds the left-fragment half of bridge analysis. See BridgeEndpoint.
+    fn bridge_endpoint(&self, left: &TryRegion, index: &RegionIndex) -> BridgeEndpoint<'_> {
         // A lexical try scope includes the protected bodies of all nested try
         // regions. Treating those bodies as unrelated occupied blocks splits a
         // single DEX exception table at every nested try, even when both
         // fragments have identical handler semantics.
-        let left_scope = Self::scope_regions(left.id, regions);
-        let right_scope = Self::scope_regions(right.id, regions);
-        let endpoint_scopes = left_scope
-            .union(&right_scope)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let left_blocks = Self::scope_blocks(&left_scope, regions);
-        let right_blocks = Self::scope_blocks(&right_scope, regions);
-        let outer_blocks = left_blocks
-            .union(&right_blocks)
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let handler_signature = Self::handler_signature(left);
-        let catch_signature = Self::catch_signature(left);
-        let lexical_parent = Self::parent_outside_cleanup_envelopes(left, regions);
+        let regions = index.regions;
+        let handler_signature = index.handler_signature_of(left.id).clone();
+        let catch_signature = index.catch_signature_of(left.id).clone();
+        let lexical_parent = index.parents_outside_cleanup_envelopes[&left.id];
         let equivalent_scopes = regions
             .iter()
             .filter(|region| {
                 (region.parent == left.parent
-                    && Self::handler_signature(region) == handler_signature)
+                    && index.handler_signature_of(region.id) == &handler_signature)
                     || (!catch_signature.is_empty()
-                        && Self::catch_signature(region) == catch_signature
-                        && Self::parent_outside_cleanup_envelopes(region, regions)
-                            == lexical_parent)
+                        && index.catch_signature_of(region.id) == &catch_signature
+                        && index.parents_outside_cleanup_envelopes[&region.id] == lexical_parent)
             })
-            .flat_map(|region| Self::scope_regions(region.id, regions))
+            .flat_map(|region| index.scope(region.id).iter().copied())
             .collect::<BTreeSet<_>>();
-        let mut exception_boundary = Self::scope_blocks(&equivalent_scopes, regions);
+        let mut exception_boundary = index.scope_blocks(&equivalent_scopes);
         exception_boundary.extend(
             regions
                 .iter()
@@ -2335,56 +2684,75 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
                 .flat_map(|handler| handler.semantic_blocks.iter().copied()),
         );
         let nested_domains = NestedProtectedDomain::new(self.cfg, &exception_boundary);
-        let enclosing = Self::enclosing_regions(left, right, regions);
+        let nested_contained = regions
+            .iter()
+            .filter(|region| nested_domains.contains(region))
+            .map(|region| region.id)
+            .collect::<BTreeSet<_>>();
+        BridgeEndpoint {
+            cfg: self.cfg,
+            scope: index.scope(left.id).clone(),
+            blocks: index.scope_blocks(index.scope(left.id)),
+            handler_signature,
+            catch_signature,
+            lexical_parent,
+            equivalent_scopes,
+            exception_boundary,
+            nested_contained,
+        }
+    }
+
+    fn bridge_search<'e>(
+        &self,
+        left_endpoint: &'e BridgeEndpoint,
+        left: &TryRegion,
+        right: &TryRegion,
+        index: &'e RegionIndex,
+    ) -> BridgeSearch<'e, '_> {
+        // The endpoint block sets are shared, not rebuilt per pair: the
+        // endpoint owns the left side and the index precomputes every region's
+        // scope blocks, so a search only materializes what this pair's
+        // exclusion logic actually contributes.
+        let left_blocks = &left_endpoint.blocks;
+        let right_blocks = index.region_scope_blocks(right.id);
+        let endpoint_scopes = left_endpoint
+            .scope
+            .union(index.scope(right.id))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let regions = index.regions;
+        let enclosing = index.enclosing_regions(left, right);
         let transparent_scopes = regions
             .iter()
             .filter(|region| {
                 !endpoint_scopes.contains(&region.id)
                     && !enclosing.contains(&region.id)
-                    && (Self::handler_signature(region) == handler_signature
+                    && (Self::handler_signature(region) == left_endpoint.handler_signature
                         || Self::preserves_exception(region)
-                        || nested_domains.contains(region))
+                        || left_endpoint.nested_contained.contains(&region.id))
             })
             .map(|region| region.id)
             .collect::<BTreeSet<_>>();
-        let transparent_blocks = regions
-            .iter()
-            .filter(|region| transparent_scopes.contains(&region.id))
-            .flat_map(|region| region.blocks.iter().copied())
-            .collect::<BTreeSet<_>>();
-        let mut occupied = BTreeSet::new();
-        for region in regions {
-            if !endpoint_scopes.contains(&region.id)
-                && !enclosing.contains(&region.id)
-                && !transparent_scopes.contains(&region.id)
-            {
-                occupied.extend(region.blocks.iter().copied());
-            }
-            // Exception handlers are never part of a normal lexical bridge,
-            // including handlers owned by either endpoint scope.
-            occupied.extend(
-                region
-                    .handlers
-                    .iter()
-                    .flat_map(|handler| handler.blocks.iter().copied()),
-            );
-        }
-        let candidates = self
-            .cfg
-            .blocks
-            .keys()
-            .copied()
-            .filter(|block| {
-                !left_blocks.contains(block)
-                    && !right_blocks.contains(block)
-                    && !occupied.contains(block)
-                    && (transparent_blocks.contains(block) || !self.throwing_blocks.contains(block))
-            })
-            .collect::<BTreeSet<_>>();
+        // The occupied set of the set formulation is exactly "some non-excluded
+        // region protects the block"; the owner lists answer that per block, so
+        // the excluded scopes are merged once and consulted lazily.
+        let mut excluded_scopes = endpoint_scopes.clone();
+        excluded_scopes.extend(enclosing.iter().copied());
+        excluded_scopes.extend(transparent_scopes.iter().copied());
+        // Exception handlers are never part of a normal lexical bridge,
+        // including handlers owned by either endpoint scope.
+        let candidates = CandidateFilter {
+            owners: &index.block_owners,
+            excluded_scopes,
+            transparent_scopes,
+            handler_blocks: &index.handler_blocks,
+            throwing_blocks: &self.throwing_blocks,
+            left_blocks,
+            right_blocks,
+        };
         BridgeSearch {
             left_blocks,
             right_blocks,
-            outer_blocks,
             endpoint_scopes,
             candidates,
         }
@@ -2396,6 +2764,7 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
         targets: &BTreeSet<BlockId>,
         endpoint_scopes: &BTreeSet<u32>,
         regions: &[TryRegion],
+        index: &RegionIndex,
     ) -> Option<BTreeSet<BlockId>> {
         let endpoint_handlers = regions
             .iter()
@@ -2403,23 +2772,22 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
             .flat_map(|region| &region.handlers)
             .flat_map(|handler| handler.blocks.iter().copied())
             .collect::<BTreeSet<_>>();
-        let candidates = regions
-            .iter()
-            .flat_map(|region| {
-                region.blocks.iter().copied().chain(
-                    region
-                        .handlers
-                        .iter()
-                        .flat_map(|handler| handler.blocks.iter().copied()),
-                )
-            })
-            .filter(|block| {
-                !sources.contains(block)
-                    && !targets.contains(block)
-                    && !endpoint_handlers.contains(block)
-            })
-            .collect::<BTreeSet<_>>();
-        ExceptionalPathClosure::new(self.cfg).between(sources, targets, &candidates)
+        let candidates = CorridorFilter {
+            owners: &index.block_owners,
+            handler_blocks: &index.handler_blocks,
+            endpoint_handlers: &endpoint_handlers,
+            sources,
+            targets,
+        };
+        let all_predecessors = self
+            .all_predecessors
+            .get_or_init(|| self.cfg.predecessor_snapshot());
+        ExceptionalPathClosure::new(self.cfg).between(
+            sources,
+            targets,
+            &candidates,
+            all_predecessors,
+        )
     }
 
     fn preserves_exception(region: &TryRegion) -> bool {
@@ -2427,97 +2795,6 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
             && region.handlers.iter().all(|handler| {
                 handler.kind == HandlerKind::Cleanup && !handler.rethrow_blocks.is_empty()
             })
-    }
-
-    fn catch_signature(region: &TryRegion) -> Vec<HandlerClauseSignature> {
-        let mut signature = region
-            .handlers
-            .iter()
-            .filter(|handler| handler.kind == HandlerKind::Catch)
-            .map(|handler| HandlerClauseSignature {
-                catch_type: handler.catch_type.clone(),
-                kind: handler.kind,
-                continuation: handler.canonical_entry,
-            })
-            .collect::<Vec<_>>();
-        signature.sort_unstable();
-        signature
-    }
-
-    fn parent_outside_cleanup_envelopes(region: &TryRegion, regions: &[TryRegion]) -> Option<u32> {
-        let mut parent = region.parent;
-        let mut visited = BTreeSet::new();
-        while let Some(parent_id) = parent {
-            if !visited.insert(parent_id) {
-                break;
-            }
-            let Some(owner) = regions.iter().find(|candidate| candidate.id == parent_id) else {
-                break;
-            };
-            if owner.handlers.is_empty()
-                || owner
-                    .handlers
-                    .iter()
-                    .any(|handler| handler.kind == HandlerKind::Catch)
-            {
-                break;
-            }
-            parent = owner.parent;
-        }
-        parent
-    }
-
-    fn scope_regions(owner: u32, regions: &[TryRegion]) -> BTreeSet<u32> {
-        let parents = regions
-            .iter()
-            .map(|region| (region.id, region.parent))
-            .collect::<BTreeMap<_, _>>();
-        regions
-            .iter()
-            .filter(|region| region.id == owner || Self::descends_from(region.id, owner, &parents))
-            .map(|region| region.id)
-            .collect()
-    }
-
-    fn scope_blocks(scope: &BTreeSet<u32>, regions: &[TryRegion]) -> BTreeSet<BlockId> {
-        regions
-            .iter()
-            .filter(|region| scope.contains(&region.id))
-            .flat_map(|region| region.blocks.iter().copied())
-            .collect()
-    }
-
-    fn enclosing_regions(
-        left: &TryRegion,
-        right: &TryRegion,
-        regions: &[TryRegion],
-    ) -> BTreeSet<u32> {
-        let parents = regions
-            .iter()
-            .map(|region| (region.id, region.parent))
-            .collect::<BTreeMap<_, _>>();
-        let mut enclosing = BTreeSet::new();
-        let mut pending = left
-            .parent
-            .into_iter()
-            .chain(right.parent)
-            .collect::<Vec<_>>();
-        while let Some(region) = pending.pop() {
-            if !enclosing.insert(region) {
-                continue;
-            }
-            pending.extend(parents.get(&region).copied().flatten());
-        }
-        let start = left.start_offset.min(right.start_offset);
-        let end = left.end_offset.max(right.end_offset);
-        enclosing.extend(regions.iter().filter_map(|region| {
-            let strictly_contains = region.start_offset <= start
-                && end <= region.end_offset
-                && (region.start_offset < start || end < region.end_offset);
-            (region.id != left.id && region.id != right.id && strictly_contains)
-                .then_some(region.id)
-        }));
-        enclosing
     }
 
     fn merge(
@@ -2548,8 +2825,17 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
         // unambiguous, but bridge analysis needs both endpoint subtrees.
         let mut bridge_context = regions.clone();
         bridge_context.push(right_region.clone());
+        let bridge_index = RegionIndex::of(&bridge_context);
         let bridge = matches!(domain, ProtectedDomain::Union)
-            .then(|| self.transparent_bridge(&regions[left_index], &right_region, &bridge_context))
+            .then(|| {
+                let left_endpoint = self.bridge_endpoint(&regions[left_index], &bridge_index);
+                self.transparent_bridge(
+                    &left_endpoint,
+                    &regions[left_index],
+                    &right_region,
+                    &bridge_index,
+                )
+            })
             .flatten()
             .unwrap_or_default();
         let cleanup_scope = match relation {
@@ -2561,11 +2847,11 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
         };
         let mut bridge = bridge;
         if let Some(cleanup) = &cleanup_scope {
-            let scope = Self::scope_regions(cleanup.id, &bridge_context);
-            bridge.extend(Self::scope_blocks(&scope, &bridge_context));
+            bridge.extend(bridge_index.scope_blocks(bridge_index.scope(cleanup.id)));
             if let Some(normal) = bridge_context.iter().find(|region| region.id == left) {
+                let cleanup_endpoint = self.bridge_endpoint(cleanup, &bridge_index);
                 bridge.extend(
-                    self.transparent_bridge(cleanup, normal, &bridge_context)
+                    self.transparent_bridge(&cleanup_endpoint, cleanup, normal, &bridge_index)
                         .unwrap_or_default(),
                 );
             }

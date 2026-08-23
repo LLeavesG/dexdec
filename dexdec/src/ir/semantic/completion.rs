@@ -311,10 +311,13 @@ pub(crate) struct SemanticCompletion {
 
 impl SemanticCompletion {
     pub(crate) fn analyze(root: &SemanticNode) -> Self {
-        match CompletionInterpreter::analyze(root, &SemanticCompletionDomain) {
-            Ok(completion) => completion,
-            Err(error) => match error {},
-        }
+        crate::profile_scope!(
+            "completion.analyze",
+            match CompletionInterpreter::analyze(root, &SemanticCompletionDomain) {
+                Ok(completion) => completion,
+                Err(error) => match error {},
+            }
+        )
     }
 
     pub(crate) fn can_complete_normally(&self) -> bool {

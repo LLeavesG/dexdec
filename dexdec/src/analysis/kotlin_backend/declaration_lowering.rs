@@ -41,6 +41,7 @@ impl KotlinCompilationUnitLowering {
         source_abi: &std::sync::Arc<super::KotlinSourceAbi>,
         hierarchy: std::sync::Arc<crate::ir::analysis::ClassHierarchyIndex>,
         observer: std::sync::Arc<dyn crate::ir::AnalysisObserver>,
+        parallel_methods: bool,
     ) -> Result<KotlinCompilationUnit, KotlinDecompilerError> {
         let package_name = class.declaration.package.clone();
         let package = package_name.as_ref().map(ToString::to_string);
@@ -78,6 +79,19 @@ impl KotlinCompilationUnitLowering {
             }
             type_uses
         });
+        // Enclosing-instance entries scoped to the unit's referenced types
+        // (mirroring the Java backend) instead of the whole archive catalog.
+        let outer_instances = crate::profile_scope!("kotlin_backend.lower.outer_instances", {
+            source_abi
+                .referenced_outer_instances(type_uses.iter())
+                .into_iter()
+                .chain(
+                    class
+                        .outer_instances()
+                        .map(|(field, outer)| (field.clone(), outer.clone())),
+                )
+                .collect()
+        });
         let names = crate::profile_scope!("kotlin_backend.lower.type_names", {
             KotlinTypeNameResolver::for_class(
                 class,
@@ -113,11 +127,6 @@ impl KotlinCompilationUnitLowering {
             .into_iter()
             .map(|(identity, interface)| Ok((identity, names.resolve_generic_type(&interface)?)))
             .collect::<Result<_, KotlinDecompilerError>>()?;
-        let outer_instances = source_abi
-            .outer_instances()
-            .chain(class.outer_instances())
-            .map(|(field, outer)| (field.clone(), outer.clone()))
-            .collect();
         let mut imports = names
             .imports()
             .filter(|import| source_abi.import_is_accessible(import))
@@ -137,6 +146,7 @@ impl KotlinCompilationUnitLowering {
                 source_object_types,
                 outer_instances,
                 observer,
+                parallel_methods,
             )
             .lower(class)
         })?;
@@ -195,6 +205,19 @@ impl KotlinSingleMethodLowering {
         for contract in generic_methods.values() {
             GenericTypeUses::method_contract(contract, &mut type_uses);
         }
+        // Enclosing-instance entries scoped to the method's referenced types
+        // (mirroring the Java backend) instead of the whole archive catalog.
+        let mut outer_instances = source_abi
+            .referenced_outer_instances(type_uses.iter())
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if let Some((field, outer)) = method
+            .body
+            .as_ref()
+            .and_then(super::kotlin_model::method::KotlinMethodBody::outer_instance_field)
+        {
+            outer_instances.insert(field.clone(), outer.clone());
+        }
         let names = KotlinTypeNameResolver::new(current_package, current_type, type_uses)?;
         let members = std::sync::Arc::new(
             ClassMemberNames::method_only(current_type, method)
@@ -217,17 +240,6 @@ impl KotlinSingleMethodLowering {
                 ))
             })
             .collect::<Result<_, KotlinDecompilerError>>()?;
-        let mut outer_instances = source_abi
-            .outer_instances()
-            .map(|(field, outer)| (field.clone(), outer.clone()))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        if let Some((field, outer)) = method
-            .body
-            .as_ref()
-            .and_then(super::kotlin_model::method::KotlinMethodBody::outer_instance_field)
-        {
-            outer_instances.insert(field.clone(), outer.clone());
-        }
         let lowering = KotlinTypeLowering::new(
             &names,
             members.as_ref(),
@@ -242,6 +254,7 @@ impl KotlinSingleMethodLowering {
             std::collections::BTreeMap::new(),
             outer_instances,
             observer,
+            true,
         );
         lowering.method(
             method,
@@ -261,6 +274,7 @@ struct KotlinTypeLowering<'a> {
     constants: KotlinConstantLowering<'a>,
     source_field_types:
         std::sync::Arc<std::collections::BTreeMap<crate::ir::FieldReference, KotlinType>>,
+    class_generic_uses: std::sync::Arc<std::collections::BTreeSet<ArgType>>,
     generic_fields: std::sync::Arc<
         std::collections::BTreeMap<
             crate::ir::FieldReference,
@@ -281,8 +295,15 @@ struct KotlinTypeLowering<'a> {
     >,
     source_object_types: std::sync::Arc<std::collections::BTreeMap<ArgType, KotlinType>>,
     outer_instances: std::collections::BTreeMap<crate::ir::FieldReference, ArgType>,
+    /// Outer instance types resolved once per owner instead of once per
+    /// method; keyed by the outer owner type. `None` marks a failed
+    /// resolution and keeps it off the fast path. The lock lets method jobs
+    /// share the cache when bodies lower in parallel.
+    outer_source_cache:
+        std::sync::Mutex<std::collections::HashMap<ArgType, Option<KotlinType>>>,
     generic_type_projection: std::sync::Arc<dyn crate::language::kotlin::GenericTypeProjection>,
     observer: std::sync::Arc<dyn crate::ir::AnalysisObserver>,
+    parallel_methods: bool,
 }
 
 #[derive(Debug)]
@@ -548,7 +569,38 @@ impl<'a> KotlinTypeLowering<'a> {
         source_object_types: std::collections::BTreeMap<ArgType, KotlinType>,
         outer_instances: std::collections::BTreeMap<crate::ir::FieldReference, ArgType>,
         observer: std::sync::Arc<dyn crate::ir::AnalysisObserver>,
+        parallel_methods: bool,
     ) -> Self {
+        // Class-level outer owners all resolve to the same types regardless of
+        // which method asks, so the answers are computed once here. Failed
+        // resolutions stay uncached as None and replay resolve_outer_source
+        // per method so the propagated error is unchanged.
+        let mut outer_source_cache = std::collections::HashMap::new();
+        for outer in outer_instances.values() {
+            let resolved = match source_abi.owner_type(outer) {
+                Some(owner) => names
+                    .resolve_generic_type(&JvmTypeSignature::ClassType(owner.clone()))
+                    .ok(),
+                None => names.resolve_type(outer).ok(),
+            };
+            outer_source_cache.insert(outer.clone(), resolved);
+        }
+        let outer_source_cache = std::sync::Mutex::new(outer_source_cache);
+        // The generic contracts are class-level facts, so the type uses they
+        // contribute are identical for every method; collecting them once here
+        // keeps per-method lowering from re-walking every contract. The set
+        // matches what the per-method collection produced: these uses merged
+        // into a sorted set before anything consumes their order.
+        let class_generic_uses = {
+            let mut generic_uses = Vec::new();
+            for contract in generic_fields.values() {
+                GenericTypeUses::field_contract(contract, &mut generic_uses);
+            }
+            for contract in generic_methods.values() {
+                GenericTypeUses::method_contract(contract, &mut generic_uses);
+            }
+            std::sync::Arc::new(generic_uses.into_iter().collect::<std::collections::BTreeSet<_>>())
+        };
         Self {
             names,
             members,
@@ -556,11 +608,13 @@ impl<'a> KotlinTypeLowering<'a> {
             source_abi,
             constants: KotlinConstantLowering::new(names, members),
             source_field_types: std::sync::Arc::new(source_field_types),
+            class_generic_uses,
             generic_fields: std::sync::Arc::new(generic_fields),
             generic_methods: std::sync::Arc::new(generic_methods),
             method_nullability: std::sync::Arc::new(method_nullability),
             source_object_types: std::sync::Arc::new(source_object_types),
             outer_instances,
+            outer_source_cache,
             generic_type_projection: std::sync::Arc::new(SourceGenericTypeProjection {
                 names: names.clone(),
                 source_abi: shared_source_abi,
@@ -568,7 +622,46 @@ impl<'a> KotlinTypeLowering<'a> {
                 cache: GenericProjectionCache::default(),
             }),
             observer,
+            parallel_methods,
         }
+    }
+
+    /// Resolve the source type of one class-level outer instance owner.
+    fn resolve_outer_source(&self, outer: &ArgType) -> Result<KotlinType, KotlinDecompilerError> {
+        let source = self
+            .source_abi
+            .owner_type(outer)
+            .map(|outer| {
+                self.names
+                    .resolve_generic_type(&JvmTypeSignature::ClassType(outer.clone()))
+            })
+            .transpose()?
+            .map(Ok)
+            .unwrap_or_else(|| self.names.resolve_type(outer))?;
+        Ok(source)
+    }
+
+    /// `resolve_outer_source` memoized per owner. Resolution depends only on
+    /// fixed resolver state, so every method asking about the same owner gets
+    /// the same type; failed resolutions stay uncached and replay so each
+    /// caller still observes the original error.
+    fn outer_source_cached(&self, outer: &ArgType) -> Result<KotlinType, KotlinDecompilerError> {
+        if let Some(source) = self
+            .outer_source_cache
+            .lock()
+            .unwrap()
+            .get(outer)
+            .cloned()
+            .flatten()
+        {
+            return Ok(source);
+        }
+        let resolved = self.resolve_outer_source(outer)?;
+        self.outer_source_cache
+            .lock()
+            .unwrap()
+            .insert(outer.clone(), Some(resolved.clone()));
+        Ok(resolved)
     }
 
     fn lower(
@@ -695,7 +788,7 @@ impl<'a> KotlinTypeLowering<'a> {
                 source_constructor_count,
             )
         };
-        let lowered = if class.methods.len() < 8 {
+        let lowered = if !self.parallel_methods || class.methods.len() < 8 {
             class.methods.iter().map(lower).collect::<Vec<_>>()
         } else {
             class.methods.par_iter().map(lower).collect::<Vec<_>>()
@@ -1294,7 +1387,8 @@ impl<'a> KotlinTypeLowering<'a> {
     ) -> Result<KotlinMethodDeclaration, KotlinDecompilerError> {
         let declaration = &method.declaration;
         let signature = declaration.signature.as_ref();
-        let annotations = self.method_annotations(declaration)?;
+        let annotations =
+            crate::profile_scope!("lower.m.annotations", self.method_annotations(declaration))?;
         // The contract is keyed by the DEX member, so the reference has to be
         // rebuilt from the DEX name rather than from the Kotlin identifier the
         // model already renamed and escaped.
@@ -1314,16 +1408,21 @@ impl<'a> KotlinTypeLowering<'a> {
                 return_type: declaration.return_type.clone().unwrap_or(ArgType::VOID),
             },
         });
-        let nullability_contract = method_reference
-            .as_ref()
-            .and_then(|method| self.source_abi.method_nullability(method));
-        let extension_receiver_index = method_reference
-            .as_ref()
-            .and_then(|method| self.source_abi.declared_extension_receiver(method));
-        let suspend_declaration = method_reference
-            .as_ref()
-            .and_then(|method| self.source_abi.declared_suspend_function(method))
-            .cloned();
+        let (nullability_contract, extension_receiver_index, suspend_declaration) =
+            crate::profile_scope!("lower.m.abi", {
+                (
+                    method_reference
+                        .as_ref()
+                        .and_then(|method| self.source_abi.method_nullability(method)),
+                    method_reference
+                        .as_ref()
+                        .and_then(|method| self.source_abi.declared_extension_receiver(method)),
+                    method_reference
+                        .as_ref()
+                        .and_then(|method| self.source_abi.declared_suspend_function(method))
+                        .cloned(),
+                )
+            });
         let mut name_scope = crate::language::kotlin::KotlinNameScope::default();
         let parameter_naming = super::semantic_naming::ParameterNameRecovery::new(self.names);
         let mut visible_parameter = 0usize;
@@ -1363,7 +1462,7 @@ impl<'a> KotlinTypeLowering<'a> {
             })
             .collect::<Vec<_>>();
         let mut visible_index = 0usize;
-        let parameters = declaration
+        let parameters = crate::profile_scope!("lower.m.params", declaration
             .parameters
             .iter()
             .enumerate()
@@ -1403,33 +1502,47 @@ impl<'a> KotlinTypeLowering<'a> {
                     default_value: None,
                 })
             })
-            .collect::<Result<Vec<_>, KotlinDecompilerError>>()?;
+            .collect::<Result<Vec<_>, KotlinDecompilerError>>()?);
         let extension_receiver_position = extension_receiver_index
             .and_then(|receiver| visible_parameter_position(&declaration.parameters, receiver));
         let suspend_continuation_position = suspend_declaration.as_ref().and_then(|suspend| {
             visible_parameter_position(&declaration.parameters, suspend.continuation_parameter)
         });
-        let declared_return_type = method_reference
-            .as_ref()
-            .and_then(|method| self.source_abi.declared_return_type(method));
-        let mut return_type = self.method_return_type(declaration, signature)?;
-        if let (Some(return_type), Some(declared_type)) =
-            (return_type.as_mut(), declared_return_type)
-        {
-            Self::apply_declared_type_qualifiers(return_type, declared_type);
-        }
-        let throws = self.method_throws(declaration, signature)?;
+        let (mut return_type, throws) = crate::profile_scope!("lower.m.signature", {
+            let declared_return_type = method_reference
+                .as_ref()
+                .and_then(|method| self.source_abi.declared_return_type(method));
+            let mut return_type = self.method_return_type(declaration, signature)?;
+            if let (Some(return_type), Some(declared_type)) =
+                (return_type.as_mut(), declared_return_type)
+            {
+                let return_type = &mut *return_type;
+                Self::apply_declared_type_qualifiers(return_type, declared_type);
+            }
+            let throws = self.method_throws(declaration, signature)?;
+            Ok::<_, KotlinDecompilerError>((return_type, throws))
+        })?;
         let instance_scope = declaration.kind != MethodModelKind::ClassInitializer
             && !declaration.modifiers.contains(&KotlinModifier::Static);
         let lexical_owner = instance_scope.then_some(owner).flatten();
         let lexical_class_signature = instance_scope.then_some(class_signature).flatten();
-        let source_current_type =
-            self.source_current_type(lexical_owner, lexical_class_signature)?;
-        let source_type_erasures =
-            self.type_variable_erasures(lexical_owner, lexical_class_signature, signature);
-        let source_type_bounds =
-            self.type_variable_bounds(lexical_owner, lexical_class_signature, signature)?;
-        let generic_throw_types = self.generic_throw_types(signature, lexical_class_signature)?;
+        let (source_current_type, source_type_erasures, source_type_bounds, generic_throw_types) =
+            crate::profile_scope!("lower.m.typevars", {
+                let source_current_type =
+                    self.source_current_type(lexical_owner, lexical_class_signature)?;
+                let source_type_erasures =
+                    self.type_variable_erasures(lexical_owner, lexical_class_signature, signature);
+                let source_type_bounds =
+                    self.type_variable_bounds(lexical_owner, lexical_class_signature, signature)?;
+                let generic_throw_types =
+                    self.generic_throw_types(signature, lexical_class_signature)?;
+                Ok::<_, KotlinDecompilerError>((
+                    source_current_type,
+                    source_type_erasures,
+                    source_type_bounds,
+                    generic_throw_types,
+                ))
+            })?;
         let mut visible_parameters = parameters.iter();
         let source_parameter_types = declaration
             .parameters
@@ -1450,42 +1563,24 @@ impl<'a> KotlinTypeLowering<'a> {
             .map(Self::failure_body)
             .map(Ok)
             .or_else(|| {
-                method.body.as_ref().map(|body| {
-                    let mut outer_instances = self
-                        .outer_instances
-                        .iter()
-                        .map(|(field, outer)| {
-                            let source =
-                                self.source_abi
-                                    .owner_type(outer)
-                                    .map(|outer| {
-                                        self.names.resolve_generic_type(
-                                            &JvmTypeSignature::ClassType(outer.clone()),
-                                        )
-                                    })
-                                    .transpose()?
-                                    .map(Ok)
-                                    .unwrap_or_else(|| self.names.resolve_type(outer))?;
-                            Ok((field.clone(), source))
-                        })
-                        .collect::<Result<std::collections::BTreeMap<_, _>, KotlinDecompilerError>>(
-                        )?;
-                    if let Some((field, outer)) = body.outer_instance_field() {
-                        let source = self
-                            .source_abi
-                            .owner_type(outer)
-                            .map(|outer| {
-                                self.names
-                                    .resolve_generic_type(&JvmTypeSignature::ClassType(
-                                        outer.clone(),
-                                    ))
-                            })
-                            .transpose()?
-                            .map(Ok)
-                            .unwrap_or_else(|| self.names.resolve_type(outer))?;
-                        outer_instances.insert(field.clone(), source);
-                    }
-                    crate::profile_scope!("kotlin_backend.lower.method_body", {
+                method.body.as_ref().and_then(|body| {
+                    let resolved_outer = crate::profile_scope!("lower.m.outer", {
+                        (|| -> Result<std::collections::BTreeMap<_, _>, KotlinDecompilerError> {
+                            let mut outer_instances =
+                                std::collections::BTreeMap::new();
+                            for (field, outer) in &self.outer_instances {
+                                let source = self.outer_source_cached(outer)?;
+                                outer_instances.insert(field.clone(), source);
+                            }
+                            if let Some((field, outer)) = body.outer_instance_field() {
+                                let source = self.outer_source_cached(outer)?;
+                                outer_instances.insert(field.clone(), source);
+                            }
+                            Ok(outer_instances)
+                        })()
+                    });
+                    let outer_instances = resolved_outer.ok()?;
+                    let lowered = crate::profile_scope!("kotlin_backend.lower.method_body", {
                         body.lower(
                             &parameter_names,
                             self.names,
@@ -1493,6 +1588,7 @@ impl<'a> KotlinTypeLowering<'a> {
                             source_field_types.clone(),
                             self.generic_fields.clone(),
                             self.generic_methods.clone(),
+                            self.class_generic_uses.clone(),
                             self.method_nullability.clone(),
                             self.source_abi.declared_extension_receivers(),
                             self.source_abi.declared_default_calls(),
@@ -1520,7 +1616,8 @@ impl<'a> KotlinTypeLowering<'a> {
                             declaration.kind.is_class_initializer(),
                             self.observer.clone(),
                         )
-                    })
+                    });
+                    Some(lowered)
                 })
             })
             .transpose()?;

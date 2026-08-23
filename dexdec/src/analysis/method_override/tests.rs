@@ -258,6 +258,7 @@ fn detects_override_against_platform_hierarchy() {
                 throws: Vec::new(),
                 access_flags: AccessInfo::for_method(0x0001),
             }],
+            method_candidates: OnceLock::new(),
         },
     };
     let method = hierarchy.app.methods[0].clone();
@@ -739,6 +740,7 @@ fn override_analysis_skips_a_broken_class_and_continues() {
             ArgType::INT,
             0x0001,
         )],
+        method_candidates: OnceLock::new(),
     };
     let hierarchy = LocalHierarchy::new([healthy.clone(), broken.clone()]);
     let mut sink = OverrideSink::default();
@@ -856,6 +858,7 @@ fn class_with_signature<const P: usize, const M: usize>(
         generic_signature,
         instantiated_self: None,
         methods: methods.into_iter().collect(),
+        method_candidates: OnceLock::new(),
     }
 }
 

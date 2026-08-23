@@ -654,6 +654,45 @@ impl KotlinSourceAbi {
         resolve_method: impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync,
         resolve_field: impl Fn(&ClassNode, u32) -> Option<FieldReference> + Sync,
     ) -> Self {
+        Self::analyze_inner(classes, contract_roots, None, resolve_method, resolve_field)
+    }
+
+    pub(crate) fn analyze_with_preterminated_cfgs<'a, 'cfg>(
+        classes: impl IntoIterator<Item = &'a ClassNode>,
+        contract_roots: &BTreeSet<MethodReference>,
+        cfgs: impl IntoIterator<Item = &'cfg CFG>,
+        resolve_method: impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync,
+        resolve_field: impl Fn(&ClassNode, u32) -> Option<FieldReference> + Sync,
+    ) -> Self {
+        let cfgs = cfgs
+            .into_iter()
+            .map(|cfg| {
+                (
+                    MethodReference {
+                        owner: cfg.method().owner().clone(),
+                        name: cfg.method().name().to_string(),
+                        descriptor: cfg.method().descriptor().clone(),
+                    },
+                    cfg,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        Self::analyze_inner(
+            classes,
+            contract_roots,
+            Some(cfgs),
+            resolve_method,
+            resolve_field,
+        )
+    }
+
+    fn analyze_inner<'a, 'cfg>(
+        classes: impl IntoIterator<Item = &'a ClassNode>,
+        contract_roots: &BTreeSet<MethodReference>,
+        preterminated_cfgs: Option<BTreeMap<MethodReference, &'cfg CFG>>,
+        resolve_method: impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync,
+        resolve_field: impl Fn(&ClassNode, u32) -> Option<FieldReference> + Sync,
+    ) -> Self {
         let classes = classes.into_iter().collect::<Vec<_>>();
         let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
         let mark = |name: &str, started: std::time::Instant| {
@@ -675,6 +714,7 @@ impl KotlinSourceAbi {
                 let nullability = super::nullability::DexNullabilityContracts::analyze(
                     &classes,
                     contract_roots,
+                    preterminated_cfgs,
                     &resolve_method,
                     &resolve_field,
                 );

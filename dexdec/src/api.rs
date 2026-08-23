@@ -472,16 +472,31 @@ impl DecompilerContext {
             for insn in &mut block.insns {
                 // Resolve method references
                 if let Some(method_idx) = insn.payload.method_index {
-                    let raw = reader
-                        .get_method(dex_idx, method_idx)
-                        .ok_or(crate::frontend::DexError::InvalidMethodIndex(method_idx))?
-                        .to_string();
-                    let method = raw.parse::<MethodReference>().map_err(|source| {
-                        crate::frontend::DexError::InvalidMemberReference {
-                            reference: raw,
-                            source,
+                    let method = if matches!(
+                        insn.payload.reference.as_deref(),
+                        Some(MemberReference::Method(_))
+                    ) {
+                        match *insn
+                            .payload
+                            .reference
+                            .take()
+                            .expect("method reference checked above")
+                        {
+                            MemberReference::Method(method) => method,
+                            MemberReference::Field(_) => unreachable!(),
                         }
-                    })?;
+                    } else {
+                        let raw = reader
+                            .get_method(dex_idx, method_idx)
+                            .ok_or(crate::frontend::DexError::InvalidMethodIndex(method_idx))?
+                            .to_string();
+                        raw.parse::<MethodReference>().map_err(|source| {
+                            crate::frontend::DexError::InvalidMemberReference {
+                                reference: raw,
+                                source,
+                            }
+                        })?
+                    };
                     normalize_invoke_args(insn, &method)?;
                     apply_invoke_return_type(insn, &method);
                     insn.payload.reference = Some(Box::new(MemberReference::Method(method)));
@@ -489,16 +504,31 @@ impl DecompilerContext {
 
                 // Resolve field references
                 if let Some(field_idx) = insn.payload.field_index {
-                    let raw = reader
-                        .get_field(dex_idx, field_idx)
-                        .ok_or(crate::frontend::DexError::InvalidFieldIndex(field_idx))?
-                        .to_string();
-                    let field = raw.parse::<FieldReference>().map_err(|source| {
-                        crate::frontend::DexError::InvalidMemberReference {
-                            reference: raw,
-                            source,
+                    let field = if matches!(
+                        insn.payload.reference.as_deref(),
+                        Some(MemberReference::Field(_))
+                    ) {
+                        match *insn
+                            .payload
+                            .reference
+                            .take()
+                            .expect("field reference checked above")
+                        {
+                            MemberReference::Field(field) => field,
+                            MemberReference::Method(_) => unreachable!(),
                         }
-                    })?;
+                    } else {
+                        let raw = reader
+                            .get_field(dex_idx, field_idx)
+                            .ok_or(crate::frontend::DexError::InvalidFieldIndex(field_idx))?
+                            .to_string();
+                        raw.parse::<FieldReference>().map_err(|source| {
+                            crate::frontend::DexError::InvalidMemberReference {
+                                reference: raw,
+                                source,
+                            }
+                        })?
+                    };
                     apply_field_type(insn, &field);
                     insn.payload.reference = Some(Box::new(MemberReference::Field(field)));
                 }
@@ -530,6 +560,44 @@ impl DecompilerContext {
                         ));
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve member identities without changing the decoder's raw register
+    /// arguments or inferred types. Archive-wide Kotlin nullability consumes
+    /// this representation before full source-generation enrichment.
+    fn resolve_member_references_with(
+        reader: &DexFileReader,
+        ir: &mut CFG,
+        dex_idx: usize,
+    ) -> DexResult<()> {
+        for instruction in ir.blocks.values_mut().flat_map(|block| &mut block.insns) {
+            if let Some(method_idx) = instruction.payload.method_index {
+                let raw = reader
+                    .get_method(dex_idx, method_idx)
+                    .ok_or(crate::frontend::DexError::InvalidMethodIndex(method_idx))?
+                    .to_string();
+                let method = raw.parse::<MethodReference>().map_err(|source| {
+                    crate::frontend::DexError::InvalidMemberReference {
+                        reference: raw,
+                        source,
+                    }
+                })?;
+                instruction.payload.reference = Some(Box::new(MemberReference::Method(method)));
+            } else if let Some(field_idx) = instruction.payload.field_index {
+                let raw = reader
+                    .get_field(dex_idx, field_idx)
+                    .ok_or(crate::frontend::DexError::InvalidFieldIndex(field_idx))?
+                    .to_string();
+                let field = raw.parse::<FieldReference>().map_err(|source| {
+                    crate::frontend::DexError::InvalidMemberReference {
+                        reference: raw,
+                        source,
+                    }
+                })?;
+                instruction.payload.reference = Some(Box::new(MemberReference::Field(field)));
             }
         }
         Ok(())
@@ -651,8 +719,15 @@ impl DecompilerContext {
     }
 
     fn prepare_java_source_abi(&mut self) -> Result<(), DecompileError> {
+        self.prepare_java_source_abi_with_cached_resolution(false)
+    }
+
+    fn prepare_java_source_abi_with_cached_resolution(
+        &mut self,
+        resolve_cached: bool,
+    ) -> Result<(), DecompileError> {
         let revision = self.reader.loaded_classes_revision();
-        if let Some((cached_revision, source_abi)) = &self.java_source_abi_cache {
+        if let Some((cached_revision, _)) = &self.java_source_abi_cache {
             if *cached_revision == revision {
                 return Ok(());
             }
@@ -674,6 +749,19 @@ impl DecompilerContext {
         let mut methods = Vec::with_capacity(candidates.len());
         for (owner, method) in candidates {
             methods.push(self.decode_class_method(&owner, method, false));
+        }
+        if resolve_cached {
+            for method in &mut methods {
+                let Some(cfg) = method.cfg_mut() else {
+                    continue;
+                };
+                let owner = cfg.method().owner().to_descriptor();
+                let dex_idx = self
+                    .reader
+                    .get_dex_index(&owner)
+                    .ok_or_else(|| crate::frontend::DexError::MissingDexForClass(owner.clone()))?;
+                Self::resolve_symbols_with(&self.reader, cfg, dex_idx)?;
+            }
         }
         let fo_ms = t0.elapsed();
         let t1 = std::time::Instant::now();
@@ -1130,12 +1218,12 @@ impl DecompilerContext {
         })
     }
 
-    pub(crate) fn prepare_archive_source_abi(
+    pub(crate) fn prepare_archive_source_abi_before_termination(
         &mut self,
         prepare_java: bool,
         prepare_kotlin: bool,
     ) -> Result<(), DecompileError> {
-        crate::profile_scope!("api.prepare_archive_source_abi", {
+        crate::profile_scope!("api.prepare_archive_source_abi_before_termination", {
             let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
             if prepare_kotlin {
                 let roots = self
@@ -1147,7 +1235,7 @@ impl DecompilerContext {
             }
             if prepare_java {
                 let started = std::time::Instant::now();
-                self.prepare_java_source_abi()?;
+                self.prepare_java_source_abi_with_cached_resolution(true)?;
                 if stats {
                     eprintln!(
                         "dexdec batch: java_abi={:.0}ms",
@@ -1155,9 +1243,19 @@ impl DecompilerContext {
                     );
                 }
             }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn prepare_archive_source_abi_after_termination(
+        &mut self,
+        prepare_kotlin: bool,
+    ) -> Result<(), DecompileError> {
+        crate::profile_scope!("api.prepare_archive_source_abi_after_termination", {
+            let stats = std::env::var_os("DEXDEC_BATCH_STATS").is_some();
             if prepare_kotlin {
                 let started = std::time::Instant::now();
-                self.kotlin_source_abi()?;
+                self.prepare_kotlin_source_abi_from_archive_cfgs()?;
                 if stats {
                     eprintln!(
                         "dexdec batch: kotlin_abi={:.0}ms",
@@ -1165,6 +1263,10 @@ impl DecompilerContext {
                     );
                 }
             }
+            crate::profile_scope!(
+                "api.resolve_archive_method_symbols",
+                self.resolve_archive_method_symbols()
+            )?;
             let started = std::time::Instant::now();
             self.type_hierarchy()?;
             if stats {
@@ -1177,14 +1279,84 @@ impl DecompilerContext {
         })
     }
 
+    fn prepare_kotlin_source_abi_from_archive_cfgs(
+        &mut self,
+    ) -> Result<Arc<KotlinSourceAbi>, DecompileError> {
+        let revision = self.reader.loaded_classes_revision();
+        if let Some((cached_revision, source_abi)) = &self.kotlin_source_abi_cache {
+            if *cached_revision == revision {
+                return Ok(Arc::clone(source_abi));
+            }
+        }
+        let source_abi = {
+            let reader = &self.reader;
+            Arc::new(KotlinSourceAbi::analyze_with_preterminated_cfgs(
+                reader.classes(),
+                &self.kotlin_contract_roots,
+                self.method_irs
+                    .values()
+                    .flat_map(|methods| methods.values()),
+                |class, method_index| {
+                    let dex_index = reader.get_dex_index(class.type_descriptor())?;
+                    reader
+                        .get_method(dex_index, method_index)?
+                        .to_string()
+                        .parse()
+                        .ok()
+                },
+                |class, field_index| {
+                    let dex_index = reader.get_dex_index(class.type_descriptor())?;
+                    reader
+                        .get_field(dex_index, field_index)?
+                        .to_string()
+                        .parse()
+                        .ok()
+                },
+            ))
+        };
+        let dependencies = source_abi
+            .analysis_dependencies()
+            .map(ArgType::to_descriptor)
+            .collect::<Vec<_>>();
+        let before = self.reader.loaded_classes_revision();
+        for owner in dependencies {
+            self.reader.load_class(&owner)?;
+        }
+        if self.reader.loaded_classes_revision() != before {
+            // The decoded archive set no longer covers every loaded class.
+            // Fall back to the standalone path, which decodes the expanded
+            // graph and preserves the interactive/subset behavior exactly.
+            return self.kotlin_source_abi();
+        }
+        let revision = self.reader.loaded_classes_revision();
+        self.kotlin_source_abi_cache = Some((revision, Arc::clone(&source_abi)));
+        Ok(source_abi)
+    }
+
+    fn resolve_archive_method_symbols(&mut self) -> Result<(), DecompileError> {
+        let reader = &self.reader;
+        self.method_irs
+            .par_iter_mut()
+            .try_for_each(|(class_name, methods)| -> DexResult<()> {
+                let dex_idx = reader.get_dex_index(class_name).ok_or_else(|| {
+                    crate::frontend::DexError::MissingDexForClass(class_name.clone())
+                })?;
+                for cfg in methods.values_mut() {
+                    Self::resolve_symbols_with(reader, cfg, dex_idx)?;
+                }
+                Ok(())
+            })?;
+        Ok(())
+    }
+
     pub(crate) fn prefetch_decoded_methods(&mut self) -> Result<(), DecompileError> {
         crate::profile_scope!("api.prefetch_decoded_methods", {
             self.sync_method_cache_revision();
 
             let mut specs = Vec::new();
             for class in self.reader.classes() {
-                let class_name = class.type_descriptor().to_string();
-                let Some(dex_idx) = self.reader.get_dex_index(&class_name) else {
+                let class_name = class.type_descriptor();
+                let Some(dex_idx) = self.reader.get_dex_index(class_name) else {
                     continue;
                 };
                 for method in class.methods() {
@@ -1195,19 +1367,19 @@ impl DecompilerContext {
                     let cache_key = format!("{}{}", method.info.name, descriptor);
                     if self
                         .method_irs
-                        .get(&class_name)
+                        .get(class_name)
                         .is_some_and(|methods| methods.contains_key(&cache_key))
                     {
                         continue;
                     }
                     specs.push(MethodDecodeSpec {
-                        class_name: class_name.clone(),
+                        class_name,
                         cache_key,
-                        method_name: method.info.name.clone(),
-                        method_code: code.clone(),
-                        owner: class.class_type().clone(),
-                        param_types: method.info.param_types.clone(),
-                        return_type: method.info.return_type.clone(),
+                        method_name: &method.info.name,
+                        method_code: code,
+                        owner: class.class_type(),
+                        param_types: &method.info.param_types,
+                        return_type: &method.info.return_type,
                         is_static: method.access_flags.is_static(),
                         declared_synchronized: method.access_flags.is_declared_synchronized(),
                         dex_idx,
@@ -1892,39 +2064,39 @@ fn apply_field_type(insn: &mut InsnNode, field: &FieldReference) {
     }
 }
 
-struct MethodDecodeSpec {
-    class_name: String,
+struct MethodDecodeSpec<'a> {
+    class_name: &'a str,
     cache_key: String,
-    method_name: String,
-    method_code: MethodCode,
-    owner: ArgType,
-    param_types: Vec<ArgType>,
-    return_type: ArgType,
+    method_name: &'a str,
+    method_code: &'a MethodCode,
+    owner: &'a ArgType,
+    param_types: &'a [ArgType],
+    return_type: &'a ArgType,
     is_static: bool,
     declared_synchronized: bool,
     dex_idx: usize,
 }
 
-impl MethodDecodeSpec {
+impl MethodDecodeSpec<'_> {
     fn decode(
         self,
         reader: &DexFileReader,
     ) -> Result<(String, String, CFG), crate::frontend::DexError> {
-        let mut ir = DecompilerContext::decode_method_code(&self.method_code)?;
+        let mut ir = DecompilerContext::decode_method_code(self.method_code)?;
         ir.set_method(
             MethodContext::new(
-                self.owner,
-                self.method_name,
+                self.owner.clone(),
+                self.method_name.to_string(),
                 MethodDescriptor {
-                    parameters: self.param_types,
-                    return_type: self.return_type,
+                    parameters: self.param_types.to_vec(),
+                    return_type: self.return_type.clone(),
                 },
                 self.is_static,
             )
             .with_declared_synchronization(self.declared_synchronized),
         );
-        DecompilerContext::resolve_symbols_with(reader, &mut ir, self.dex_idx)?;
-        Ok((self.class_name, self.cache_key, ir))
+        DecompilerContext::resolve_member_references_with(reader, &mut ir, self.dex_idx)?;
+        Ok((self.class_name.to_string(), self.cache_key, ir))
     }
 }
 

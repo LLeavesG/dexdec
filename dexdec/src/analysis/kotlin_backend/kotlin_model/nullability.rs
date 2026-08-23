@@ -22,6 +22,7 @@ impl DexNullabilityContracts {
     pub(super) fn analyze(
         classes: &[&ClassNode],
         contract_roots: &BTreeSet<MethodReference>,
+        preterminated_cfgs: Option<BTreeMap<MethodReference, &CFG>>,
         resolve_method: &(impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync),
         resolve_field: &(impl Fn(&ClassNode, u32) -> Option<crate::ir::FieldReference> + Sync),
     ) -> Self {
@@ -38,7 +39,8 @@ impl DexNullabilityContracts {
         let metadata = NullabilityMetadata::analyze(classes);
         mark("metadata", t);
         let t = std::time::Instant::now();
-        let cfgs = MethodCfgCatalog::analyze(classes, resolve_method, resolve_field);
+        let cfgs =
+            MethodCfgCatalog::analyze(classes, preterminated_cfgs, resolve_method, resolve_field);
         mark("cfg_catalog", t);
         let t = std::time::Instant::now();
         let mut non_null_fields = metadata.non_null_fields.clone();
@@ -616,14 +618,16 @@ struct ParameterId {
 /// One resolved raw CFG per loaded method. Nullability analyses share this
 /// catalog so termination, return flow, and field flow observe identical
 /// control-flow and member identities.
-#[derive(Debug, Default)]
-struct MethodCfgCatalog {
-    methods: BTreeMap<MethodReference, CFG>,
+#[derive(Debug)]
+enum MethodCfgCatalog<'cfg> {
+    Owned(BTreeMap<MethodReference, CFG>),
+    Borrowed(BTreeMap<MethodReference, &'cfg CFG>),
 }
 
-impl MethodCfgCatalog {
+impl<'cfg> MethodCfgCatalog<'cfg> {
     fn analyze(
         classes: &[&ClassNode],
+        preterminated_cfgs: Option<BTreeMap<MethodReference, &'cfg CFG>>,
         resolve_method: &(impl Fn(&ClassNode, u32) -> Option<MethodReference> + Sync),
         resolve_field: &(impl Fn(&ClassNode, u32) -> Option<crate::ir::FieldReference> + Sync),
     ) -> Self {
@@ -637,6 +641,26 @@ impl MethodCfgCatalog {
             }
         };
         let t = std::time::Instant::now();
+        if let Some(methods) = preterminated_cfgs.filter(|methods| {
+            let expected = classes
+                .iter()
+                .flat_map(|class| class.methods())
+                .filter(|method| method.code().is_some())
+                .count();
+            methods.len() == expected
+                && classes.iter().all(|class| {
+                    class
+                        .methods()
+                        .iter()
+                        .filter(|method| method.code().is_some())
+                        .all(|method| {
+                            methods.contains_key(&DexNullabilityContracts::reference(class, method))
+                        })
+                })
+        }) {
+            mark("cfg_reuse", t);
+            return Self::Borrowed(methods);
+        }
         let mut methods = classes
             .par_iter()
             .flat_map_iter(|class| {
@@ -691,11 +715,28 @@ impl MethodCfgCatalog {
             termination.apply(cfg);
         });
         mark("cfg_term_apply", t);
-        Self { methods }
+        Self::Owned(methods)
     }
 
     fn get(&self, method: &MethodReference) -> Option<&CFG> {
-        self.methods.get(method)
+        match self {
+            Self::Owned(methods) => methods.get(method),
+            Self::Borrowed(methods) => methods.get(method).copied(),
+        }
+    }
+
+    fn contains_key(&self, method: &MethodReference) -> bool {
+        match self {
+            Self::Owned(methods) => methods.contains_key(method),
+            Self::Borrowed(methods) => methods.contains_key(method),
+        }
+    }
+
+    fn entries(&self) -> Vec<(&MethodReference, &CFG)> {
+        match self {
+            Self::Owned(methods) => methods.iter().collect(),
+            Self::Borrowed(methods) => methods.iter().map(|(method, cfg)| (method, *cfg)).collect(),
+        }
     }
 
     fn unresolved_termination_owners(
@@ -704,7 +745,7 @@ impl MethodCfgCatalog {
     ) -> BTreeSet<crate::ir::ArgType> {
         relevant
             .iter()
-            .filter_map(|method| self.methods.get(method))
+            .filter_map(|method| self.get(method))
             .flat_map(|cfg| cfg.blocks.values())
             .flat_map(|block| &block.insns)
             .filter(|instruction| {
@@ -715,7 +756,7 @@ impl MethodCfgCatalog {
                     )
             })
             .filter_map(|instruction| match instruction.payload.reference.as_deref() {
-                Some(MemberReference::Method(method)) if !self.methods.contains_key(method) => {
+                Some(MemberReference::Method(method)) if !self.contains_key(method) => {
                     Some(method.owner.clone())
                 }
                 _ => None,
@@ -1426,8 +1467,8 @@ impl InstanceFieldEvidence {
         // creates entries), so each method's scan can run concurrently against
         // the same key set and merge afterwards.
         let produced = cfgs
-            .methods
-            .par_iter()
+            .entries()
+            .into_par_iter()
             .filter(|(reference, _)| !reference.is_constructor())
             .filter_map(|(reference, cfg)| {
                 let entry = cfg.entry_block().map(|block| block.id)?;

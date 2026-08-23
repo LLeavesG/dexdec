@@ -539,11 +539,15 @@ impl Decompiler {
         let prefetch_ms = t1.elapsed();
         let t2 = Instant::now();
         self.context
-            .prepare_archive_source_abi(needs_java, needs_kotlin)?;
-        let abi_ms = t2.elapsed();
+            .prepare_archive_source_abi_before_termination(needs_java, needs_kotlin)?;
+        let abi_prefix_ms = t2.elapsed();
         let t3 = Instant::now();
         self.context.apply_archive_termination()?;
         let termination_ms = t3.elapsed();
+        let t4 = Instant::now();
+        self.context
+            .prepare_archive_source_abi_after_termination(needs_kotlin)?;
+        let abi_ms = abi_prefix_ms + t4.elapsed();
 
         let include_nested = self.options.include_nested;
         let observer = Arc::clone(&self.observer);

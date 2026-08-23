@@ -557,7 +557,11 @@ impl<'a> ExceptionAnalyzer<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let region_ms = t2c.elapsed();
         let t2d = std::time::Instant::now();
-        SharedHandlerDomains::analyze(self.cfg, &regions).apply(&mut regions);
+        crate::profile_scope!(
+            "exception.shared_handler_domains",
+            SharedHandlerDomains::analyze(self.cfg, &regions)
+        )
+        .apply(&mut regions);
         let mut regions =
             ExceptionScopeNormalization::new(self.cfg, &self.normal_predecessors).apply(regions)?;
         let norm_ms = t2d.elapsed();
@@ -2074,12 +2078,23 @@ impl<'cfg> ExceptionScopeNormalization<'cfg> {
         mut regions: Vec<TryRegion>,
     ) -> Result<Vec<TryRegion>, ExceptionInvariantError> {
         loop {
-            let before = ExceptionScopeLayout::of(&regions);
-            regions = ExceptionScopeCoalescing::new(self.cfg, self.predecessors).apply(regions)?;
-            regions = ExceptionScopeNesting::new(self.cfg)
-                .apply(regions)?
-                .without_empty_scopes();
-            let after = ExceptionScopeLayout::of(&regions);
+            let before = crate::profile_scope!(
+                "exception.normalization.layout_before",
+                ExceptionScopeLayout::of(&regions)
+            );
+            regions = crate::profile_scope!(
+                "exception.normalization.coalescing",
+                ExceptionScopeCoalescing::new(self.cfg, self.predecessors).apply(regions)
+            )?;
+            regions = crate::profile_scope!(
+                "exception.normalization.nesting",
+                ExceptionScopeNesting::new(self.cfg).apply(regions)
+            )?
+            .without_empty_scopes();
+            let after = crate::profile_scope!(
+                "exception.normalization.layout_after",
+                ExceptionScopeLayout::of(&regions)
+            );
             if after == before {
                 return Ok(regions);
             }
@@ -2131,32 +2146,55 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
         // scanners' priority order decides which rewrite applies next, so the
         // sequence of relations is part of the observable output.
         while let Some(relation) = self.relation(&regions) {
-            self.merge(&mut regions, relation)?;
+            crate::profile_scope!("exception.coalescing.merge", {
+                self.merge(&mut regions, relation)
+            })?;
         }
         Ok(regions)
     }
 
     fn relation(&self, regions: &[TryRegion]) -> Option<ScopeRewrite> {
-        if let Some((owner, nested)) = self.redundant_nested_handler_scope(regions) {
+        if let Some((owner, nested)) = crate::profile_scope!(
+            "exception.coalescing.redundant",
+            self.redundant_nested_handler_scope(regions)
+        ) {
             return Some(ScopeRewrite::Redundant { owner, nested });
         }
-        if let Some((child, parent)) = self.inherited_cleanup(regions) {
+        if let Some((child, parent)) = crate::profile_scope!(
+            "exception.coalescing.inherited_cleanup",
+            self.inherited_cleanup(regions)
+        ) {
             return Some(ScopeRewrite::InheritedCleanup { child, parent });
         }
-        if let Some((owner, extension)) = self.handler_extension(regions) {
+        if let Some((owner, extension)) = crate::profile_scope!(
+            "exception.coalescing.handler_extension",
+            self.handler_extension(regions)
+        ) {
             return Some(ScopeRewrite::HandlerExtension { owner, extension });
         }
-        if let Some(scope) = self.cleanup_alternatives(regions) {
+        if let Some(scope) = crate::profile_scope!(
+            "exception.coalescing.cleanup_alternatives",
+            self.cleanup_alternatives(regions)
+        ) {
             return Some(ScopeRewrite::CleanupAlternatives(scope));
         }
-        if let Some((left, right)) = self.cleanup_bridge(regions) {
+        if let Some((left, right)) = crate::profile_scope!(
+            "exception.coalescing.cleanup_bridge",
+            self.cleanup_bridge(regions)
+        ) {
             return Some(ScopeRewrite::CleanupBridge { left, right });
         }
-        if let Some((left, right)) = self.cleanup_continuation(regions) {
+        if let Some((left, right)) = crate::profile_scope!(
+            "exception.coalescing.cleanup_continuation",
+            self.cleanup_continuation(regions)
+        ) {
             return Some(ScopeRewrite::CleanupContinuation { left, right });
         }
-        self.connected_fragments(regions)
-            .map(|(left, right)| ScopeRewrite::Connected { left, right })
+        crate::profile_scope!(
+            "exception.coalescing.connected_fragments",
+            self.connected_fragments(regions)
+        )
+        .map(|(left, right)| ScopeRewrite::Connected { left, right })
     }
 
     fn redundant_nested_handler_scope(&self, regions: &[TryRegion]) -> Option<(u32, u32)> {
@@ -2224,11 +2262,13 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
     }
 
     fn connected_fragments(&self, regions: &[TryRegion]) -> Option<(u32, u32)> {
-        let index = RegionIndex::of(regions);
-        let signatures = regions
-            .iter()
-            .map(|region| Self::effective_handler_signature(region, &index))
-            .collect::<Vec<_>>();
+        let index = crate::profile_scope!("exception.connected.index", RegionIndex::of(regions));
+        let signatures = crate::profile_scope!("exception.connected.signatures", {
+            regions
+                .iter()
+                .map(|region| Self::effective_handler_signature(region, &index))
+                .collect::<Vec<_>>()
+        });
         let lexical_parents = regions
             .iter()
             .map(|region| index.parents_outside_cleanup_envelopes[&region.id])
@@ -2240,16 +2280,18 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
             }
             groups.entry(signature.as_slice()).or_default().push(index);
         }
+        // Bridge proofs are substantially more expensive than the ordering
+        // predicates. The old scan proved every pair, collected every
+        // successful candidate, then sorted that collection. Build and sort
+        // the same candidate order first so the first successful proof is
+        // already the relation the old algorithm would have selected.
         let mut candidates = Vec::new();
         for group in groups.values() {
             if group.len() < 2 {
-                // A single-member group has no pair to evaluate; skipping also
-                // avoids building an unused endpoint below.
                 continue;
             }
             for &left_index in group {
                 let left = &regions[left_index];
-                let left_endpoint = self.bridge_endpoint(left, &index);
                 for &right_index in group {
                     if left_index == right_index {
                         continue;
@@ -2261,22 +2303,43 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
                     if !(siblings && (ordered || overlaps)) {
                         continue;
                     }
-                    if self.has_transparent_bridge(&left_endpoint, left, right, &index) {
-                        candidates.push((
-                            usize::from(left.parent != right.parent),
-                            left.start_offset,
-                            right.start_offset,
-                            left.id,
-                            right.id,
-                        ));
-                    }
+                    candidates.push((
+                        usize::from(left.parent != right.parent),
+                        left.start_offset,
+                        right.start_offset,
+                        left.id,
+                        right.id,
+                        left_index,
+                        right_index,
+                    ));
                 }
             }
         }
         candidates.sort_unstable();
-        candidates
-            .first()
-            .map(|(_, _, _, left, right)| (*left, *right))
+        let mut endpoints = std::iter::repeat_with(|| None)
+            .take(regions.len())
+            .collect::<Vec<Option<BridgeEndpoint<'_>>>>();
+        for (_, _, _, left, right, left_index, right_index) in candidates {
+            if endpoints[left_index].is_none() {
+                endpoints[left_index] = Some(crate::profile_scope!(
+                    "exception.connected.endpoint",
+                    self.bridge_endpoint(&regions[left_index], &index)
+                ));
+            }
+            if crate::profile_scope!("exception.connected.bridge", {
+                self.has_transparent_bridge(
+                    endpoints[left_index]
+                        .as_ref()
+                        .expect("connected endpoint was initialized"),
+                    &regions[left_index],
+                    &regions[right_index],
+                    &index,
+                )
+            }) {
+                return Some((left, right));
+            }
+        }
+        None
     }
 
     /// DEX protects each catch body separately when it must execute the same
@@ -3904,39 +3967,60 @@ impl SharedHandlerDomains {
                 .or_default()
                 .push(handler);
         }
-        let domains = groups
-            .into_iter()
-            .map(|(key, handlers)| {
-                let entries = handlers
-                    .iter()
-                    .flat_map(|handler| handler.entry_blocks.iter().copied())
-                    .collect::<BTreeSet<_>>();
-                let flows = handlers
-                    .iter()
-                    .map(|handler| Self::exception_flow(cfg, handler))
-                    .collect::<Option<Vec<_>>>();
-                let common = flows.and_then(|flows| {
-                    let mut flows = flows.into_iter();
-                    let mut common = flows.next()?;
-                    for flow in flows {
-                        common.retain(|value| flow.contains(value));
-                    }
-                    Some(common)
-                });
-                let exception = common
+        let predecessors = cfg.normal_predecessor_snapshot();
+        // Groups are ordered by canonical entry and then handler kind. Retain
+        // only the current entry's reverse distances so sibling clause kinds
+        // can reuse them without keeping one graph-sized map per handler.
+        let mut distance_cache = None::<(BlockId, BTreeMap<BlockId, usize>)>;
+        let mut domains = BTreeMap::new();
+        for (key, handlers) in groups {
+            let entries = handlers
+                .iter()
+                .flat_map(|handler| handler.entry_blocks.iter().copied())
+                .collect::<BTreeSet<_>>();
+            let flows = handlers
+                .iter()
+                .map(|handler| Self::exception_flow(cfg, handler))
+                .collect::<Option<Vec<_>>>();
+            let common = flows.and_then(|flows| {
+                let mut flows = flows.into_iter();
+                let mut common = flows.next()?;
+                for flow in flows {
+                    common.retain(|value| flow.contains(value));
+                }
+                Some(common)
+            });
+            let exception = if let Some(values) = common.as_ref() {
+                if distance_cache
                     .as_ref()
-                    .and_then(|values| Self::reaching_definition(cfg, key.entry, values));
-                let proven = entries.len() > 1 && exception.is_some();
-                (
-                    key,
-                    SharedHandlerDomain {
-                        entries,
-                        exception,
-                        proven,
-                    },
+                    .is_none_or(|(entry, _)| *entry != key.entry)
+                {
+                    distance_cache = Some((
+                        key.entry,
+                        Self::reverse_distances(key.entry, &predecessors),
+                    ));
+                }
+                Self::reaching_definition(
+                    cfg,
+                    values,
+                    &distance_cache
+                        .as_ref()
+                        .expect("shared-handler distances were initialized")
+                        .1,
                 )
-            })
-            .collect();
+            } else {
+                None
+            };
+            let proven = entries.len() > 1 && exception.is_some();
+            domains.insert(
+                key,
+                SharedHandlerDomain {
+                    entries,
+                    exception,
+                    proven,
+                },
+            );
+        }
         Self { domains }
     }
 
@@ -3970,13 +4054,13 @@ impl SharedHandlerDomains {
 
     fn reaching_definition(
         cfg: &CFG,
-        entry: BlockId,
         candidates: &BTreeSet<SsaVar>,
+        distances: &BTreeMap<BlockId, usize>,
     ) -> Option<RegisterArg> {
         cfg.block_ids()
             .into_iter()
             .filter_map(|block| {
-                let distance = Self::distance(cfg, block, entry)?;
+                let distance = *distances.get(&block)?;
                 cfg.block(block)?.insns.iter().find_map(|instruction| {
                     let result = instruction.result.as_ref()?;
                     let value = SsaVar::from_reg(result)?;
@@ -3991,22 +4075,27 @@ impl SharedHandlerDomains {
             .map(|(_, _, value)| value)
     }
 
-    fn distance(cfg: &CFG, source: BlockId, target: BlockId) -> Option<usize> {
-        let mut pending = VecDeque::from([(source, 0usize)]);
-        let mut visited = BTreeSet::new();
+    fn reverse_distances(
+        target: BlockId,
+        predecessors: &BTreeMap<BlockId, Vec<BlockId>>,
+    ) -> BTreeMap<BlockId, usize> {
+        let mut pending = VecDeque::from([(target, 0usize)]);
+        let mut distances = BTreeMap::new();
         while let Some((block, distance)) = pending.pop_front() {
-            if !visited.insert(block) {
+            if distances.contains_key(&block) {
                 continue;
             }
-            if block == target {
-                return Some(distance);
-            }
+            distances.insert(block, distance);
             pending.extend(
-                cfg.normal_successors(block)
-                    .map(|successor| (successor, distance + 1)),
+                predecessors
+                    .get(&block)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .map(|predecessor| (predecessor, distance + 1)),
             );
         }
-        None
+        distances
     }
 }
 
@@ -5029,6 +5118,28 @@ mod tests {
         let right = try_region(2, 4, 8, &[2], vec![catch_handler(3, &[3]), cleanup]);
 
         assert!(conflicting_shared_catch_entries(&[left, right]).is_empty());
+    }
+
+    #[test]
+    fn shared_handler_reverse_distances_match_normal_paths() {
+        let mut cfg = CFG::new("shared_handler_reverse_distances");
+        for block in 0..=4 {
+            cfg.add_block(Block::new(block));
+        }
+        cfg.add_edge(BlockId::new(0), BlockId::new(1), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(1), BlockId::new(2), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(0), BlockId::new(3), EdgeKind::Normal);
+        cfg.add_edge(BlockId::new(3), BlockId::new(1), EdgeKind::Normal);
+
+        let predecessors = cfg.normal_predecessor_snapshot();
+        let distances =
+            SharedHandlerDomains::reverse_distances(BlockId::new(2), &predecessors);
+
+        assert_eq!(distances.get(&BlockId::new(2)), Some(&0));
+        assert_eq!(distances.get(&BlockId::new(1)), Some(&1));
+        assert_eq!(distances.get(&BlockId::new(0)), Some(&2));
+        assert_eq!(distances.get(&BlockId::new(3)), Some(&2));
+        assert!(!distances.contains_key(&BlockId::new(4)));
     }
 
     #[test]

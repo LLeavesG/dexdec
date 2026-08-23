@@ -223,9 +223,10 @@ impl TypeConstraintGraph {
                 }
             }
             InsnType::NewInstance => {
-                if let (Some(result), Some(ty)) =
-                    (&instruction.result, instruction.payload.class_type.as_deref())
-                {
+                if let (Some(result), Some(ty)) = (
+                    &instruction.result,
+                    instruction.payload.class_type.as_deref(),
+                ) {
                     self.add_register_bound(result, BoundKind::Exact, ty.clone());
                 }
             }

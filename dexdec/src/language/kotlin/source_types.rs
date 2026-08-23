@@ -2603,7 +2603,8 @@ impl<'a> SourceTypeFlow<'a> {
         self.invocations
             .iter()
             .filter_map(|operation| {
-                let MemberReference::Method(method) = operation.payload.reference.as_deref()? else {
+                let MemberReference::Method(method) = operation.payload.reference.as_deref()?
+                else {
                     return None;
                 };
                 let Some((mut solver, _, contract)) = self.invocation_solver(operation) else {
@@ -3473,15 +3474,14 @@ impl<'a> SourceTypeFlow<'a> {
             SemanticExpression::Operation(operation)
                 if operation.insn_type == InsnType::Constructor =>
             {
-                let Some(owner) =
-                    operation
-                        .payload
-                        .reference
-                        .as_deref()
-                        .and_then(|reference| match reference {
-                            MemberReference::Method(method) => Some(&method.owner),
-                            MemberReference::Field(_) => None,
-                        })
+                let Some(owner) = operation
+                    .payload
+                    .reference
+                    .as_deref()
+                    .and_then(|reference| match reference {
+                        MemberReference::Method(method) => Some(&method.owner),
+                        MemberReference::Field(_) => None,
+                    })
                 else {
                     return false;
                 };
@@ -3836,15 +3836,12 @@ impl<'a> SourceTypeFlow<'a> {
                     .result
                     .as_ref()
                     .is_some_and(|result| result.ty == ArgType::BOOLEAN)
-                    || operation
-                        .payload
-                        .reference
-                        .as_deref()
-                        .and_then(|reference| match reference {
+                    || operation.payload.reference.as_deref().and_then(
+                        |reference| match reference {
                             MemberReference::Method(method) => Some(&method.descriptor.return_type),
                             MemberReference::Field(field) => Some(&field.field_type),
-                        })
-                        == Some(&ArgType::BOOLEAN)
+                        },
+                    ) == Some(&ArgType::BOOLEAN)
             }
             SemanticExpression::Register(register) => {
                 register.ty == ArgType::BOOLEAN

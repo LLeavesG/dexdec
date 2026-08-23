@@ -1886,11 +1886,16 @@ mod tests {
             ..SemanticFlowGraph::default()
         };
         for (source, target) in [(0, 1), (0, 2), (1, 3), (2, 3), (3, 1)] {
-            graph.successors.entry(points[source]).or_default().push(points[target]);
-            graph.predecessors.entry(points[target]).or_default().push((
-                points[source],
-                SemanticFlowEdgeKind::Normal,
-            ));
+            graph
+                .successors
+                .entry(points[source])
+                .or_default()
+                .push(points[target]);
+            graph
+                .predecessors
+                .entry(points[target])
+                .or_default()
+                .push((points[source], SemanticFlowEdgeKind::Normal));
         }
         graph.entries.insert(points[0]);
 

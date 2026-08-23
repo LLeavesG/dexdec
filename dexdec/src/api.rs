@@ -550,14 +550,13 @@ impl DecompilerContext {
                         let descriptor = reader
                             .get_type(dex_idx, type_idx)
                             .ok_or(crate::frontend::DexError::InvalidTypeIndex(type_idx))?;
-                        insn.payload.class_type = Some(Box::new(
-                            descriptor.parse::<ArgType>().map_err(|source| {
-                                crate::frontend::DexError::InvalidDescriptor {
+                        insn.payload.class_type =
+                            Some(Box::new(descriptor.parse::<ArgType>().map_err(
+                                |source| crate::frontend::DexError::InvalidDescriptor {
                                     descriptor: descriptor.to_string(),
                                     source,
-                                }
-                            })?,
-                        ));
+                                },
+                            )?));
                     }
                 }
             }
@@ -1719,10 +1718,12 @@ fn exact_call_targets(cfg: &CFG) -> impl Iterator<Item = MethodReference> + '_ {
                     Some(InvokeType::Static | InvokeType::Direct | InvokeType::Super)
                 )
         })
-        .filter_map(|instruction| match instruction.payload.reference.as_deref() {
-            Some(MemberReference::Method(method)) => Some(method.clone()),
-            _ => None,
-        })
+        .filter_map(
+            |instruction| match instruction.payload.reference.as_deref() {
+                Some(MemberReference::Method(method)) => Some(method.clone()),
+                _ => None,
+            },
+        )
 }
 
 fn contract_roots<'a>(
@@ -1735,10 +1736,12 @@ fn contract_roots<'a>(
             cfg.blocks
                 .values()
                 .flat_map(|block| &block.insns)
-                .filter_map(|instruction| match instruction.payload.reference.as_deref() {
-                    Some(MemberReference::Method(method)) => Some(method.clone()),
-                    _ => None,
-                }),
+                .filter_map(
+                    |instruction| match instruction.payload.reference.as_deref() {
+                        Some(MemberReference::Method(method)) => Some(method.clone()),
+                        _ => None,
+                    },
+                ),
         );
     }
     roots

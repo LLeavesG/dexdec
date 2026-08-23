@@ -299,8 +299,7 @@ struct KotlinTypeLowering<'a> {
     /// method; keyed by the outer owner type. `None` marks a failed
     /// resolution and keeps it off the fast path. The lock lets method jobs
     /// share the cache when bodies lower in parallel.
-    outer_source_cache:
-        std::sync::Mutex<std::collections::HashMap<ArgType, Option<KotlinType>>>,
+    outer_source_cache: std::sync::Mutex<std::collections::HashMap<ArgType, Option<KotlinType>>>,
     generic_type_projection: std::sync::Arc<dyn crate::language::kotlin::GenericTypeProjection>,
     observer: std::sync::Arc<dyn crate::ir::AnalysisObserver>,
     parallel_methods: bool,
@@ -599,7 +598,11 @@ impl<'a> KotlinTypeLowering<'a> {
             for contract in generic_methods.values() {
                 GenericTypeUses::method_contract(contract, &mut generic_uses);
             }
-            std::sync::Arc::new(generic_uses.into_iter().collect::<std::collections::BTreeSet<_>>())
+            std::sync::Arc::new(
+                generic_uses
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
         };
         Self {
             names,
@@ -1462,47 +1465,51 @@ impl<'a> KotlinTypeLowering<'a> {
             })
             .collect::<Vec<_>>();
         let mut visible_index = 0usize;
-        let parameters = crate::profile_scope!("lower.m.params", declaration
-            .parameters
-            .iter()
-            .enumerate()
-            .filter(|(_, parameter)| !parameter.hidden)
-            .map(|(parameter_index, parameter)| {
-                let signature_index = visible_index;
-                visible_index += 1;
-                let declared_type = method_reference.as_ref().and_then(|method| {
-                    self.source_abi
-                        .declared_parameter_type(method, parameter_index)
-                });
-                let vararg_element_nullable = method_reference.as_ref().and_then(|method| {
-                    self.source_abi
-                        .declared_vararg_element_nullable(method, parameter_index)
-                });
-                let mut ty = self.method_parameter_type(
-                    signature,
-                    signature_index,
-                    &parameter.ty,
-                    declaration
-                        .source_parameter_types
-                        .get(parameter_index)
-                        .and_then(Option::as_ref),
-                )?;
-                if let Some(declared_type) = declared_type {
-                    Self::apply_declared_type_qualifiers(&mut ty, declared_type);
-                }
-                Ok(KotlinMethodParameter {
-                    annotations: self.constants.annotations(&parameter.annotations)?,
-                    ty,
-                    name: parameter_names[parameter_index].clone(),
-                    nullable: vararg_element_nullable.unwrap_or_else(|| {
-                        !nullability_contract
-                            .is_some_and(|contract| contract.parameter_is_non_null(parameter_index))
-                    }),
-                    varargs: parameter.varargs || vararg_element_nullable.is_some(),
-                    default_value: None,
+        let parameters = crate::profile_scope!(
+            "lower.m.params",
+            declaration
+                .parameters
+                .iter()
+                .enumerate()
+                .filter(|(_, parameter)| !parameter.hidden)
+                .map(|(parameter_index, parameter)| {
+                    let signature_index = visible_index;
+                    visible_index += 1;
+                    let declared_type = method_reference.as_ref().and_then(|method| {
+                        self.source_abi
+                            .declared_parameter_type(method, parameter_index)
+                    });
+                    let vararg_element_nullable = method_reference.as_ref().and_then(|method| {
+                        self.source_abi
+                            .declared_vararg_element_nullable(method, parameter_index)
+                    });
+                    let mut ty = self.method_parameter_type(
+                        signature,
+                        signature_index,
+                        &parameter.ty,
+                        declaration
+                            .source_parameter_types
+                            .get(parameter_index)
+                            .and_then(Option::as_ref),
+                    )?;
+                    if let Some(declared_type) = declared_type {
+                        Self::apply_declared_type_qualifiers(&mut ty, declared_type);
+                    }
+                    Ok(KotlinMethodParameter {
+                        annotations: self.constants.annotations(&parameter.annotations)?,
+                        ty,
+                        name: parameter_names[parameter_index].clone(),
+                        nullable: vararg_element_nullable.unwrap_or_else(|| {
+                            !nullability_contract.is_some_and(|contract| {
+                                contract.parameter_is_non_null(parameter_index)
+                            })
+                        }),
+                        varargs: parameter.varargs || vararg_element_nullable.is_some(),
+                        default_value: None,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, KotlinDecompilerError>>()?);
+                .collect::<Result<Vec<_>, KotlinDecompilerError>>()?
+        );
         let extension_receiver_position = extension_receiver_index
             .and_then(|receiver| visible_parameter_position(&declaration.parameters, receiver));
         let suspend_continuation_position = suspend_declaration.as_ref().and_then(|suspend| {
@@ -1566,8 +1573,7 @@ impl<'a> KotlinTypeLowering<'a> {
                 method.body.as_ref().and_then(|body| {
                     let resolved_outer = crate::profile_scope!("lower.m.outer", {
                         (|| -> Result<std::collections::BTreeMap<_, _>, KotlinDecompilerError> {
-                            let mut outer_instances =
-                                std::collections::BTreeMap::new();
+                            let mut outer_instances = std::collections::BTreeMap::new();
                             for (field, outer) in &self.outer_instances {
                                 let source = self.outer_source_cached(outer)?;
                                 outer_instances.insert(field.clone(), source);

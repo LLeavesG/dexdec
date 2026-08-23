@@ -103,7 +103,13 @@ impl InstructionTree {
                         let argument_count = instruction.args.len();
                         let has_target = instruction.payload.compound_target.is_some();
                         let mut children = std::mem::take(&mut instruction.args);
-                        children.extend(instruction.payload.compound_target.take().map(|target| *target));
+                        children.extend(
+                            instruction
+                                .payload
+                                .compound_target
+                                .take()
+                                .map(|target| *target),
+                        );
                         pending.push(TransformTask::Instruction {
                             instruction,
                             argument_count,

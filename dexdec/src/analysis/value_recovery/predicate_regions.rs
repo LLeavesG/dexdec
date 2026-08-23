@@ -105,8 +105,7 @@ impl PredicateRegionFormation {
                 // node only; a long if-chain stays a flat sequence.
                 if !formed.is_empty() && GuardDistribution::should_try(condition, then_node) {
                     let last = formed.pop().expect("non-empty prefix");
-                    let (last, distributed) =
-                        GuardDistribution::apply(last, condition, then_node)?;
+                    let (last, distributed) = GuardDistribution::apply(last, condition, then_node)?;
                     formed.push(last);
                     if distributed {
                         self.changed = true;

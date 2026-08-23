@@ -1,23 +1,53 @@
 //! Documents the in-memory cost of the core IR node types; guards against
 //! silent growth of the hot per-instruction footprint.
-use dexdec::ir::{
-    ArgType, BoolExpr, CFG, InsnArg, InsnNode, InsnPayload, MemberReference, MethodReference,
-    RegisterArg, Utf16String,
-};
 use dexdec::ir::insn::FillArrayData;
+use dexdec::ir::{
+    ArgType, BoolExpr, InsnArg, InsnNode, InsnPayload, MemberReference, MethodReference,
+    RegisterArg, Utf16String, CFG,
+};
 
 #[test]
 fn report_core_ir_sizes() {
-    eprintln!("sizeof InsnNode        = {}", std::mem::size_of::<InsnNode>());
-    eprintln!("sizeof InsnPayload     = {}", std::mem::size_of::<InsnPayload>());
-    eprintln!("sizeof MemberReference = {}", std::mem::size_of::<MemberReference>());
-    eprintln!("sizeof MethodReference = {}", std::mem::size_of::<MethodReference>());
-    eprintln!("sizeof ArgType         = {}", std::mem::size_of::<ArgType>());
-    eprintln!("sizeof Utf16String     = {}", std::mem::size_of::<Utf16String>());
-    eprintln!("sizeof BoolExpr        = {}", std::mem::size_of::<BoolExpr>());
-    eprintln!("sizeof FillArrayData   = {}", std::mem::size_of::<FillArrayData>());
-    eprintln!("sizeof InsnArg         = {}", std::mem::size_of::<InsnArg>());
-    eprintln!("sizeof RegisterArg     = {}", std::mem::size_of::<RegisterArg>());
+    eprintln!(
+        "sizeof InsnNode        = {}",
+        std::mem::size_of::<InsnNode>()
+    );
+    eprintln!(
+        "sizeof InsnPayload     = {}",
+        std::mem::size_of::<InsnPayload>()
+    );
+    eprintln!(
+        "sizeof MemberReference = {}",
+        std::mem::size_of::<MemberReference>()
+    );
+    eprintln!(
+        "sizeof MethodReference = {}",
+        std::mem::size_of::<MethodReference>()
+    );
+    eprintln!(
+        "sizeof ArgType         = {}",
+        std::mem::size_of::<ArgType>()
+    );
+    eprintln!(
+        "sizeof Utf16String     = {}",
+        std::mem::size_of::<Utf16String>()
+    );
+    eprintln!(
+        "sizeof BoolExpr        = {}",
+        std::mem::size_of::<BoolExpr>()
+    );
+    eprintln!(
+        "sizeof FillArrayData   = {}",
+        std::mem::size_of::<FillArrayData>()
+    );
+    eprintln!(
+        "sizeof InsnArg         = {}",
+        std::mem::size_of::<InsnArg>()
+    );
+    eprintln!(
+        "sizeof RegisterArg     = {}",
+        std::mem::size_of::<RegisterArg>()
+    );
     eprintln!("sizeof CFG             = {}", std::mem::size_of::<CFG>());
 
     // Regression guard: the rare/heavy payload fields (reference, string_value,

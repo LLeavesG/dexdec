@@ -553,10 +553,9 @@ impl AcyclicExitComposer {
                             mut catches,
                             finally,
                         } if continuation.is_boundary() => {
-                            if finally
-                                .as_ref()
-                                .is_some_and(|finally| !LabelReferences::absent(&finally.body, label))
-                            {
+                            if finally.as_ref().is_some_and(|finally| {
+                                !LabelReferences::absent(&finally.body, label)
+                            }) {
                                 return None;
                             }
                             let mut body_cleanups = cleanups;
@@ -1862,7 +1861,9 @@ impl<'a> TrailingView<'a> {
             Self::Empty | Self::One(SemanticNode::Empty) => true,
             Self::One(node) => NormalCompletion::can_complete(node),
             // Sequence completion short-circuits over its children.
-            Self::Many(nodes) => nodes.iter().all(|node| NormalCompletion::can_complete(node)),
+            Self::Many(nodes) => nodes
+                .iter()
+                .all(|node| NormalCompletion::can_complete(node)),
         }
     }
 
@@ -2024,9 +2025,9 @@ impl LabelReferences {
             SemanticNode::For { body, .. } | SemanticNode::ForEach { body, .. } => {
                 Self::present(body, label)
             }
-            SemanticNode::Switch { cases, .. } => cases
-                .iter()
-                .any(|case| Self::present(&case.body, label)),
+            SemanticNode::Switch { cases, .. } => {
+                cases.iter().any(|case| Self::present(&case.body, label))
+            }
             SemanticNode::Try {
                 body,
                 catches,

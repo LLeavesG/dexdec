@@ -1541,7 +1541,8 @@ impl<'a> RegionIndex<'a> {
             let strictly_contains = region.start_offset <= start
                 && end <= region.end_offset
                 && (region.start_offset < start || end < region.end_offset);
-            (region.id != left.id && region.id != right.id && strictly_contains).then_some(region.id)
+            (region.id != left.id && region.id != right.id && strictly_contains)
+                .then_some(region.id)
         }));
         enclosing
     }
@@ -1746,8 +1747,7 @@ impl<'cfg> NormalPathClosure<'cfg> {
             .flat_map(|block| self.cfg.normal_successors(*block))
             .collect::<Vec<_>>();
         while let Some(block) = pending.pop() {
-            if protected.contains(&block) || !candidates.includes(block) || !visited.insert(block)
-            {
+            if protected.contains(&block) || !candidates.includes(block) || !visited.insert(block) {
                 continue;
             }
             forward.insert(block);
@@ -1761,8 +1761,7 @@ impl<'cfg> NormalPathClosure<'cfg> {
             .flat_map(|block| self.predecessors.get(block).into_iter().flatten().copied())
             .collect::<Vec<_>>();
         while let Some(block) = pending.pop() {
-            if protected.contains(&block) || !candidates.includes(block) || !visited.insert(block)
-            {
+            if protected.contains(&block) || !candidates.includes(block) || !visited.insert(block) {
                 continue;
             }
             backward.insert(block);
@@ -2692,11 +2691,7 @@ impl<'cfg> ExceptionScopeCoalescing<'cfg> {
         let closure = NormalPathClosure::new(self.cfg, self.predecessors);
         if search.left_blocks.is_disjoint(search.right_blocks) {
             closure
-                .between(
-                    search.left_blocks,
-                    search.right_blocks,
-                    &search.candidates,
-                )
+                .between(search.left_blocks, search.right_blocks, &search.candidates)
                 .or_else(|| {
                     self.through_exception_scopes(
                         search.left_blocks,
@@ -3995,10 +3990,8 @@ impl SharedHandlerDomains {
                     .as_ref()
                     .is_none_or(|(entry, _)| *entry != key.entry)
                 {
-                    distance_cache = Some((
-                        key.entry,
-                        Self::reverse_distances(key.entry, &predecessors),
-                    ));
+                    distance_cache =
+                        Some((key.entry, Self::reverse_distances(key.entry, &predecessors)));
                 }
                 Self::reaching_definition(
                     cfg,
@@ -5132,8 +5125,7 @@ mod tests {
         cfg.add_edge(BlockId::new(3), BlockId::new(1), EdgeKind::Normal);
 
         let predecessors = cfg.normal_predecessor_snapshot();
-        let distances =
-            SharedHandlerDomains::reverse_distances(BlockId::new(2), &predecessors);
+        let distances = SharedHandlerDomains::reverse_distances(BlockId::new(2), &predecessors);
 
         assert_eq!(distances.get(&BlockId::new(2)), Some(&0));
         assert_eq!(distances.get(&BlockId::new(1)), Some(&1));

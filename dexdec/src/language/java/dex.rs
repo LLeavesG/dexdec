@@ -3263,7 +3263,8 @@ impl DexJavaDialect {
                 InsnType::Invoke => {
                     self.intrinsic_invocation_source_type(operation)
                         .or_else(|| {
-                            let method = Self::method(operation.payload.reference.as_deref()).ok()?;
+                            let method =
+                                Self::method(operation.payload.reference.as_deref()).ok()?;
                             self.source_type(&method.descriptor.return_type).ok()
                         })
                 }

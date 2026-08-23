@@ -454,8 +454,8 @@ impl InheritedMethodAbi {
         owner_ancestors: &std::collections::BTreeSet<ArgType>,
         hierarchy: &crate::analysis::method_override::GenericTypeHierarchy,
     ) -> Option<GenericMethodContract> {
-        let candidates = declarations
-            .get(&(reference.name.clone(), reference.descriptor.clone()))?;
+        let candidates =
+            declarations.get(&(reference.name.clone(), reference.descriptor.clone()))?;
         let mut nearest: Option<(&ArgType, &GenericMethodContract)> = None;
         for (candidate_owner, contract) in candidates.iter().filter(|(candidate_owner, _)| {
             candidate_owner != &reference.owner && owner_ancestors.contains(candidate_owner)
@@ -998,7 +998,8 @@ impl KotlinSourceAbi {
                         .push((method.owner.clone(), contract.clone()));
                 }
             });
-            let mut owner_ancestors = std::collections::BTreeMap::<ArgType, std::collections::BTreeSet<ArgType>>::new();
+            let mut owner_ancestors =
+                std::collections::BTreeMap::<ArgType, std::collections::BTreeSet<ArgType>>::new();
             for class in classes {
                 let owner = open_owners
                     .get(class.class_type())
@@ -1039,8 +1040,8 @@ impl KotlinSourceAbi {
                         let entry = declarations
                             .entry((reference.name.clone(), reference.descriptor.clone()))
                             .or_default();
-                        let position = entry
-                            .partition_point(|(candidate, _)| candidate < &reference.owner);
+                        let position =
+                            entry.partition_point(|(candidate, _)| candidate < &reference.owner);
                         entry.insert(position, (reference.owner.clone(), contract.clone()));
                         generic_methods.insert(reference, contract);
                     }

@@ -4088,9 +4088,9 @@ impl DexKotlinDialect {
                 let right = self.intrinsic_source_type(when_false)?;
                 (left == right).then_some(left)
             }
-            SemanticExpression::Operation(operation) => match operation.insn_type {
-                InsnType::Iget | InsnType::Sget => {
-                    operation
+            SemanticExpression::Operation(operation) => {
+                match operation.insn_type {
+                    InsnType::Iget | InsnType::Sget => operation
                         .payload
                         .reference
                         .as_deref()
@@ -4099,47 +4099,48 @@ impl DexKotlinDialect {
                                 .source_field_type(field, operation.operands().first())
                                 .or_else(|| self.source_type(&field.field_type).ok()),
                             MemberReference::Method(_) => None,
-                        })
+                        }),
+                    InsnType::Constructor => {
+                        let owner = operation.allocation_type()?;
+                        self.source_object_types
+                            .get(owner)
+                            .cloned()
+                            .or_else(|| self.source_type(owner).ok())
+                    }
+                    InsnType::ConstClass => operation
+                        .payload
+                        .class_type
+                        .as_ref()
+                        .and_then(|represented| self.class_literal_source_type(represented)),
+                    InsnType::CheckCast => self.reference_cast_source_type(operation),
+                    InsnType::Move => operation
+                        .operands()
+                        .first()
+                        .and_then(|operand| self.intrinsic_source_type(operand)),
+                    InsnType::Aget => operation
+                        .operands()
+                        .first()
+                        .and_then(|array| self.intrinsic_source_type(array))
+                        .and_then(|array| match array {
+                            KotlinType::Array(element) => Some(element.into_type()),
+                            KotlinType::Class(_)
+                            | KotlinType::Variable(_)
+                            | KotlinType::Primitive(_) => None,
+                        }),
+                    InsnType::Invoke => {
+                        self.intrinsic_invocation_source_type(operation)
+                            .or_else(|| {
+                                let method =
+                                    Self::method(operation.payload.reference.as_deref()).ok()?;
+                                self.source_type(&method.descriptor.return_type).ok()
+                            })
+                    }
+                    _ => operation
+                        .result
+                        .as_ref()
+                        .and_then(|result| self.source_type(&result.ty).ok()),
                 }
-                InsnType::Constructor => {
-                    let owner = operation.allocation_type()?;
-                    self.source_object_types
-                        .get(owner)
-                        .cloned()
-                        .or_else(|| self.source_type(owner).ok())
-                }
-                InsnType::ConstClass => operation
-                    .payload
-                    .class_type
-                    .as_ref()
-                    .and_then(|represented| self.class_literal_source_type(represented)),
-                InsnType::CheckCast => self.reference_cast_source_type(operation),
-                InsnType::Move => operation
-                    .operands()
-                    .first()
-                    .and_then(|operand| self.intrinsic_source_type(operand)),
-                InsnType::Aget => operation
-                    .operands()
-                    .first()
-                    .and_then(|array| self.intrinsic_source_type(array))
-                    .and_then(|array| match array {
-                        KotlinType::Array(element) => Some(element.into_type()),
-                        KotlinType::Class(_)
-                        | KotlinType::Variable(_)
-                        | KotlinType::Primitive(_) => None,
-                    }),
-                InsnType::Invoke => {
-                    self.intrinsic_invocation_source_type(operation)
-                        .or_else(|| {
-                            let method = Self::method(operation.payload.reference.as_deref()).ok()?;
-                            self.source_type(&method.descriptor.return_type).ok()
-                        })
-                }
-                _ => operation
-                    .result
-                    .as_ref()
-                    .and_then(|result| self.source_type(&result.ty).ok()),
-            },
+            }
         }
     }
 

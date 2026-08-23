@@ -188,7 +188,7 @@ where
         Self { hierarchy }
     }
 
-pub fn analyze<T>(&self, target: &mut T, classes: &[ClassDetails]) -> OverrideResult<()>
+    pub fn analyze<T>(&self, target: &mut T, classes: &[ClassDetails]) -> OverrideResult<()>
     where
         T: OverrideAnalysisTarget,
     {
@@ -1335,13 +1335,15 @@ impl GenericTypeHierarchy {
             let bound = bind_class(&self.hierarchy, &owner, instantiated_owner).ok()?;
             let super_types = collect_instantiated_super_types(&self.hierarchy, &bound).ok()?;
             let declaring_erasure = JvmTypeSignature::ClassType(declaring_owner.clone()).erased();
-            let projected_owner = std::iter::once(bound)
-                .chain(super_types)
-                .find_map(|candidate| {
-                    candidate.instantiated_self.filter(|candidate| {
-                        JvmTypeSignature::ClassType(candidate.clone()).erased() == declaring_erasure
-                    })
-                })?;
+            let projected_owner =
+                std::iter::once(bound)
+                    .chain(super_types)
+                    .find_map(|candidate| {
+                        candidate.instantiated_self.filter(|candidate| {
+                            JvmTypeSignature::ClassType(candidate.clone()).erased()
+                                == declaring_erasure
+                        })
+                    })?;
             let declaration = self.hierarchy.class_details(&declaring_erasure)?;
             let substitutions = class_type_substitution(
                 &self.hierarchy,

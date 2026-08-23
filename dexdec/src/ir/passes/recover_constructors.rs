@@ -687,8 +687,7 @@ impl Pass for RecoverConstructors<'_> {
                             aliases: &plan.aliases,
                             replacement,
                         };
-                        *value =
-                            InstructionTree::transform_arg((*value).clone(), &mut rewriter)?;
+                        *value = InstructionTree::transform_arg((*value).clone(), &mut rewriter)?;
                     }
                 }
                 if let Some(target) = &mut instruction.payload.compound_target {

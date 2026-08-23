@@ -185,9 +185,9 @@ impl DexNullabilityContracts {
                     && (evidence.required != 0 || !evidence.dependencies.is_empty())
                     && evidence.dependencies.iter().all(|dependency| {
                         seed_satisfies(dependency)
-                            || method_index.get(&dependency.method).is_some_and(|&owner| {
-                                proven[owner][dependency.parameter]
-                            })
+                            || method_index
+                                .get(&dependency.method)
+                                .is_some_and(|&owner| proven[owner][dependency.parameter])
                     }));
             if holds {
                 proven[index][parameter] = true;
@@ -682,9 +682,7 @@ impl<'cfg> MethodCfgCatalog<'cfg> {
                         },
                         method.is_static(),
                     ));
-                    for instruction in
-                        cfg.blocks.values_mut().flat_map(|block| &mut block.insns)
-                    {
+                    for instruction in cfg.blocks.values_mut().flat_map(|block| &mut block.insns) {
                         if let Some(reference) = instruction
                             .payload
                             .method_index
@@ -697,7 +695,8 @@ impl<'cfg> MethodCfgCatalog<'cfg> {
                             .field_index
                             .and_then(|index| resolve_field(class, index))
                         {
-                            instruction.payload.reference = Some(Box::new(MemberReference::Field(reference)));
+                            instruction.payload.reference =
+                                Some(Box::new(MemberReference::Field(reference)));
                         }
                     }
                     Some((DexNullabilityContracts::reference(class, method), cfg))
@@ -755,12 +754,14 @@ impl<'cfg> MethodCfgCatalog<'cfg> {
                         Some(InvokeType::Static | InvokeType::Direct | InvokeType::Super)
                     )
             })
-            .filter_map(|instruction| match instruction.payload.reference.as_deref() {
-                Some(MemberReference::Method(method)) if !self.contains_key(method) => {
-                    Some(method.owner.clone())
-                }
-                _ => None,
-            })
+            .filter_map(
+                |instruction| match instruction.payload.reference.as_deref() {
+                    Some(MemberReference::Method(method)) if !self.contains_key(method) => {
+                        Some(method.owner.clone())
+                    }
+                    _ => None,
+                },
+            )
             .collect()
     }
 }

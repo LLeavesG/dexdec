@@ -289,11 +289,11 @@ impl<'a, 'hierarchy> JavaValueFixedPoint<'a, 'hierarchy> {
         let mut iterations = 0u32;
         loop {
             iterations += 1;
-            let values_changed = self.values.recover_source(method)?;
+            self.values.recover_source(method)?;
             let building_changed = StringBuildingRecovery::apply(method.body_mut())?;
             let syntax_changed = self.syntax.apply(method)?;
             let dead_changed = SemanticDeadCodeElimination::apply(method.body_mut())?;
-            if !values_changed && !building_changed && !syntax_changed && !dead_changed {
+            if !building_changed && !syntax_changed && !dead_changed {
                 return Ok(iterations);
             }
         }

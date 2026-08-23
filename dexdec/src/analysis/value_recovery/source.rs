@@ -7,9 +7,11 @@
 use std::sync::Arc;
 
 use crate::ir::{
-    SemanticControlTopology, SemanticFoldError, SemanticMethod, SemanticSiteNumbering,
-    SourceVariableContext,
+    SemanticControlTopology, SemanticMethod, SemanticSiteNumbering, SourceVariableContext,
 };
+
+#[cfg(debug_assertions)]
+use crate::ir::SemanticFoldError;
 
 use super::{
     flow::{RecoveryMode, ValueFlowGraph, ValueIdentity},
@@ -86,6 +88,7 @@ impl SourceValueRecovery {
                     ValueFlowGraph::build_source(method.body(), bindings, cache)
                 )?;
                 let plan = crate::profile_scope!("value.source.plan", graph.schedule(mode))?;
+                #[cfg(debug_assertions)]
                 let before_schedule = crate::profile_scope!(
                     "value.source.topology_before",
                     crate::ir::semantic::SemanticControlTopology::analyze(method.body())
@@ -96,6 +99,7 @@ impl SourceValueRecovery {
                 )?;
                 let source =
                     crate::profile_scope!("value.source.apply", schedule.apply(method.body_mut()))?;
+                #[cfg(debug_assertions)]
                 crate::profile_scope!(
                     "value.source.topology_after",
                     Self::verify_topology(method, &before_schedule, "source-value-schedule")
@@ -127,6 +131,7 @@ impl SourceValueRecovery {
         Ok(changed)
     }
 
+    #[cfg(debug_assertions)]
     fn verify_topology<State: SourceVariableContext>(
         method: &SemanticMethod<State>,
         before: &crate::ir::semantic::SemanticControlTopology,

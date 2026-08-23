@@ -2530,10 +2530,12 @@ impl<'a> SourceTypeFlow<'a> {
         } else {
             Vec::new()
         };
-        let definition_variables =
-            Self::retained_states(flow.definition_states.clone(), &flow.contextual_variables);
+        let definition_variables = Self::retained_states(
+            std::mem::take(&mut flow.definition_states),
+            &flow.contextual_variables,
+        );
         let definition_values = Self::retained_states(
-            flow.value_definition_states.clone(),
+            std::mem::take(&mut flow.value_definition_states),
             &flow.contextual_values,
         );
         let requirements = Self::preferred_requirement_states(

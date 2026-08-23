@@ -156,7 +156,7 @@ fn exact_internal_target<'a>(
     if instruction.insn_type != InsnType::Invoke || !exact {
         return None;
     }
-    let MemberReference::Method(target) = instruction.payload.reference.as_ref()? else {
+    let MemberReference::Method(target) = instruction.payload.reference.as_deref()? else {
         return None;
     };
     members.contains(target).then_some(target)
@@ -218,7 +218,7 @@ impl<'a> ReturnReachability<'a> {
         {
             return false;
         }
-        let Some(MemberReference::Method(target)) = instruction.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(target)) = instruction.payload.reference.as_deref() else {
             return false;
         };
         self.members.contains(target)
@@ -273,7 +273,7 @@ mod tests {
 
     fn call(target: &str) -> InsnNode {
         let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
-        invoke.payload.reference = Some(MemberReference::Method(reference(target)));
+        invoke.payload.reference = Some(Box::new(MemberReference::Method(reference(target))));
         invoke
     }
 
@@ -373,7 +373,7 @@ mod tests {
         let mut caller = graph("caller");
         let mut entry = Block::new(0);
         let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
-        invoke.payload.reference = Some(MemberReference::Method(marker));
+        invoke.payload.reference = Some(Box::new(MemberReference::Method(marker)));
         entry.push(invoke);
         entry.push(InsnNode::goto(1));
         caller.add_block(entry);
@@ -417,7 +417,7 @@ mod tests {
         let mut caller = graph("caller");
         let mut entry = Block::new(0);
         let mut invoke = InsnNode::invoke(InvokeType::Static, 0, Vec::new());
-        invoke.payload.reference = Some(MemberReference::Method(target));
+        invoke.payload.reference = Some(Box::new(MemberReference::Method(target)));
         entry.push(invoke);
         entry.push(InsnNode::goto(1));
         caller.add_block(entry);

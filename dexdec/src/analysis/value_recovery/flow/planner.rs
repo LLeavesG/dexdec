@@ -1614,7 +1614,7 @@ impl<'a> ValuePlanner<'a> {
         }
         if let SemanticExpression::Operation(operation) = value {
             if operation.insn_type == InsnType::ConstStr {
-                if let Some(value) = operation.payload.string_value.clone() {
+                if let Some(value) = operation.payload.string_value.as_deref().cloned() {
                     return SelectedValue::String(value);
                 }
             }

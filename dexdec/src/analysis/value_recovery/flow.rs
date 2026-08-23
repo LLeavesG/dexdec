@@ -816,7 +816,7 @@ impl<'ir> ValueFlowGraph<'ir> {
                     })
                 }
                 InsnType::ConstStr => Some(CanonicalKey::String(
-                    instruction.payload.string_value.clone()?,
+                    instruction.payload.string_value.as_deref().cloned()?,
                 )),
                 _ => None,
             },

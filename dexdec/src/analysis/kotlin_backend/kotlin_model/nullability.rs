@@ -667,13 +667,13 @@ impl MethodCfgCatalog {
                             .and_then(|index| resolve_method(class, index))
                         {
                             instruction.payload.reference =
-                                Some(MemberReference::Method(reference));
+                                Some(Box::new(MemberReference::Method(reference)));
                         } else if let Some(reference) = instruction
                             .payload
                             .field_index
                             .and_then(|index| resolve_field(class, index))
                         {
-                            instruction.payload.reference = Some(MemberReference::Field(reference));
+                            instruction.payload.reference = Some(Box::new(MemberReference::Field(reference)));
                         }
                     }
                     Some((DexNullabilityContracts::reference(class, method), cfg))
@@ -714,7 +714,7 @@ impl MethodCfgCatalog {
                         Some(InvokeType::Static | InvokeType::Direct | InvokeType::Super)
                     )
             })
-            .filter_map(|instruction| match instruction.payload.reference.as_ref() {
+            .filter_map(|instruction| match instruction.payload.reference.as_deref() {
                 Some(MemberReference::Method(method)) if !self.methods.contains_key(method) => {
                     Some(method.owner.clone())
                 }
@@ -844,7 +844,7 @@ impl MethodParameterNullability {
                 continue;
             };
             for instruction in &block.insns {
-                let invoked = match instruction.payload.reference.as_ref() {
+                let invoked = match instruction.payload.reference.as_deref() {
                     Some(MemberReference::Method(method)) => Some(method),
                     _ => None,
                 };
@@ -1273,7 +1273,7 @@ impl MethodReturnNullability {
             InsnType::Iget | InsnType::Sget => instruction
                 .payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .and_then(|reference| match reference {
                     MemberReference::Field(field) if field.field_type.is_reference() => Some(
                         ReturnOrigin::Proven(vec![ReturnRequirement::Field(field.clone())]),
@@ -1293,7 +1293,7 @@ impl MethodReturnNullability {
                 state.pending_result = instruction
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Method(method) => Some(method.clone()),
                         MemberReference::Field(_) => None,
@@ -1518,7 +1518,7 @@ impl InstanceFieldEvidence {
     }
 
     fn field_reference(instruction: &InsnNode) -> Option<crate::ir::FieldReference> {
-        match instruction.payload.reference.as_ref()? {
+        match instruction.payload.reference.as_deref()? {
             MemberReference::Field(field) => Some(field.clone()),
             MemberReference::Method(_) => None,
         }
@@ -1661,7 +1661,7 @@ impl ConstructorFieldFlow {
                 state.fields.insert(field, Some(value));
             }
         }
-        if let Some(MemberReference::Method(target)) = instruction.payload.reference.as_ref() {
+        if let Some(MemberReference::Method(target)) = instruction.payload.reference.as_deref() {
             let receiver_is_this = instruction
                 .args
                 .first()
@@ -1937,7 +1937,7 @@ impl StaticFieldNullability {
             if let Some(field) = instruction
                 .payload
                 .reference
-                .as_ref()
+                .as_deref()
                 .and_then(|reference| match reference {
                     MemberReference::Field(field) => Some(field.clone()),
                     MemberReference::Method(_) => None,

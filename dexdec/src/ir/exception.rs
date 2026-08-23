@@ -1115,10 +1115,10 @@ impl PrecedingHandlerProtectionArtifacts {
                 instruction
                     .payload
                     .class_type
-                    .as_ref()
+                    .as_deref()
                     .and_then(ArgType::as_object)
             })
-            .or_else(|| match instruction.payload.reference.as_ref() {
+            .or_else(|| match instruction.payload.reference.as_deref() {
                 Some(MemberReference::Method(method)) if method.is_constructor() => {
                     method.owner.as_object()
                 }

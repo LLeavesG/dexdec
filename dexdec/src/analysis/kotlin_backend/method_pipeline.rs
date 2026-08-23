@@ -374,9 +374,9 @@ impl SemanticVisitor for MethodTypeUses<'_> {
                 Err(_) => {}
             }
         }
-        self.insert_option(operation.payload.class_type.as_ref());
-        self.insert_option(operation.payload.cast_type.as_ref());
-        match operation.payload.reference.as_ref() {
+        self.insert_option(operation.payload.class_type.as_deref());
+        self.insert_option(operation.payload.cast_type.as_deref());
+        match operation.payload.reference.as_deref() {
             Some(MemberReference::Field(field)) => {
                 self.insert(&field.owner);
                 self.insert(&field.field_type);

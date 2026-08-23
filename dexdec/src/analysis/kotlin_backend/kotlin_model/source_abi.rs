@@ -205,7 +205,7 @@ impl<'a> ConstructorOriginFlow<'a> {
                         == Some(&ConstructorOrigin::This)
                 {
                     if let Some(MemberReference::Field(field)) =
-                        instruction.payload.reference.as_ref()
+                        instruction.payload.reference.as_deref()
                     {
                         if candidates.contains(field) {
                             stores.insert(field.clone());

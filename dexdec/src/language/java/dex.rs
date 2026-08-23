@@ -572,7 +572,7 @@ impl DexJavaDialect {
         else {
             return false;
         };
-        let Some(MemberReference::Field(field)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Field(field)) = operation.payload.reference.as_deref() else {
             return false;
         };
         let Some(binding) = self.outer_instance.as_ref() else {
@@ -678,7 +678,7 @@ impl DexJavaDialect {
                 if operation.insn_type != InsnType::Invoke {
                     return false;
                 }
-                let Some(actual) = Self::method(operation.payload.reference.as_ref())
+                let Some(actual) = Self::method(operation.payload.reference.as_deref())
                     .ok()
                     .map(|method| &method.descriptor.return_type)
                     .filter(|actual| actual.is_reference())
@@ -1087,7 +1087,7 @@ impl DexJavaDialect {
                 expression = &operation.operands()[0];
                 continue;
             }
-            if let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() {
+            if let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() {
                 if let ArgType::Primitive(primitive) = &method.descriptor.return_type {
                     return Some(*primitive);
                 }
@@ -1165,7 +1165,7 @@ impl DexJavaDialect {
                         .first()
                         .and_then(Self::intrinsic_primitive_type);
                 }
-                match operation.payload.reference.as_ref() {
+                match operation.payload.reference.as_deref() {
                     Some(MemberReference::Method(method)) => {
                         return method.descriptor.return_type.as_primitive();
                     }
@@ -1179,7 +1179,7 @@ impl DexJavaDialect {
                 operation
                     .payload
                     .cast_type
-                    .as_ref()
+                    .as_deref()
                     .and_then(ArgType::as_primitive)
                     .or_else(|| {
                         operation
@@ -1475,7 +1475,7 @@ impl DexJavaDialect {
             InsnType::ConstStr => Ok(JavaExpr::Literal(JavaLiteral::String(
                 insn.payload
                     .string_value
-                    .as_ref()
+                    .as_deref()
                     .ok_or(JavaLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "string_value",
@@ -1483,7 +1483,7 @@ impl DexJavaDialect {
                     .clone(),
             ))),
             InsnType::ConstClass => Ok(JavaExpr::ClassLiteral(
-                self.source_type(insn.payload.class_type.as_ref().ok_or(
+                self.source_type(insn.payload.class_type.as_deref().ok_or(
                     JavaLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "class_type",
@@ -1649,7 +1649,7 @@ impl DexJavaDialect {
                             .ok_or(JavaLoweringError::MissingArgument(insn.insn_type))?,
                     )?,
                 ),
-                ty: self.source_type(insn.payload.class_type.as_ref().ok_or(
+                ty: self.source_type(insn.payload.class_type.as_deref().ok_or(
                     JavaLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "class_type",
@@ -1683,7 +1683,7 @@ impl DexJavaDialect {
                 ),
             }),
             InsnType::Iget => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 let owner = insn
                     .operands()
                     .first()
@@ -1704,7 +1704,7 @@ impl DexJavaDialect {
                 })
             }
             InsnType::Sget => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 Ok(JavaExpr::StaticField {
                     owner: self.source_type(&field.owner)?,
                     name: self.member_names.field(field),
@@ -1712,7 +1712,7 @@ impl DexJavaDialect {
             }
             InsnType::Invoke => self.invoke(insn, None),
             InsnType::Constructor => {
-                let method = Self::method(insn.payload.reference.as_ref())?;
+                let method = Self::method(insn.payload.reference.as_deref())?;
                 let allocation_owner = insn.allocation_type().unwrap_or(&method.owner);
                 let analyzed_allocation_type = insn
                     .result
@@ -1944,7 +1944,7 @@ impl DexJavaDialect {
         Vec<&'operation SemanticExpression>,
         GenericMethodContract,
     )> {
-        let method = Self::method(operation.payload.reference.as_ref()).ok()?;
+        let method = Self::method(operation.payload.reference.as_deref()).ok()?;
         let contract = self.generic_methods.get(method)?.clone();
         let invoke_type = operation.payload.invoke_type?;
         let is_static = invoke_type == InvokeType::Static;
@@ -2083,7 +2083,7 @@ impl DexJavaDialect {
         insn: &SemanticOperation,
         expected_source_type: Option<&JavaType>,
     ) -> Result<JavaExpr, JavaLoweringError> {
-        let method = Self::method(insn.payload.reference.as_ref())?;
+        let method = Self::method(insn.payload.reference.as_deref())?;
         let invoke_type = insn
             .payload
             .invoke_type
@@ -3027,7 +3027,7 @@ impl DexJavaDialect {
                 operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Field(field) => {
                             self.outer_instance_fields.get(field).cloned().or_else(|| {
@@ -3081,7 +3081,7 @@ impl DexJavaDialect {
     }
 
     fn intrinsic_invocation_source_type(&self, operation: &SemanticOperation) -> Option<JavaType> {
-        let method = Self::method(operation.payload.reference.as_ref()).ok()?;
+        let method = Self::method(operation.payload.reference.as_deref()).ok()?;
         let (mut solver, arguments, contract) = self.invocation_solver(operation)?;
         if solver.owner_is_raw(&contract.owner)
             || contract
@@ -3125,7 +3125,7 @@ impl DexJavaDialect {
         let declared = value
             .as_operation()
             .filter(|operation| operation.insn_type == InsnType::Constructor)
-            .and_then(|operation| Self::method(operation.payload.reference.as_ref()).ok())
+            .and_then(|operation| Self::method(operation.payload.reference.as_deref()).ok())
             .and_then(|method| {
                 self.source_object_types
                     .get(&method.owner)
@@ -3227,7 +3227,7 @@ impl DexJavaDialect {
                     operation
                         .payload
                         .reference
-                        .as_ref()
+                        .as_deref()
                         .and_then(|reference| match reference {
                             MemberReference::Field(field) => self
                                 .source_field_type(field, operation.operands().first())
@@ -3263,7 +3263,7 @@ impl DexJavaDialect {
                 InsnType::Invoke => {
                     self.intrinsic_invocation_source_type(operation)
                         .or_else(|| {
-                            let method = Self::method(operation.payload.reference.as_ref()).ok()?;
+                            let method = Self::method(operation.payload.reference.as_deref()).ok()?;
                             self.source_type(&method.descriptor.return_type).ok()
                         })
                 }
@@ -3361,7 +3361,7 @@ impl DexJavaDialect {
     fn declared_expression_erasure(value: &SemanticExpression) -> Option<&ArgType> {
         match value {
             SemanticExpression::Operation(operation) => match operation.insn_type {
-                InsnType::Invoke => Self::method(operation.payload.reference.as_ref())
+                InsnType::Invoke => Self::method(operation.payload.reference.as_deref())
                     .ok()
                     .map(|method| &method.descriptor.return_type),
                 InsnType::Move => operation
@@ -3369,7 +3369,7 @@ impl DexJavaDialect {
                     .first()
                     .and_then(Self::declared_expression_erasure),
                 InsnType::CheckCast => operation.conversion_type(),
-                InsnType::Constructor => Self::method(operation.payload.reference.as_ref())
+                InsnType::Constructor => Self::method(operation.payload.reference.as_deref())
                     .ok()
                     .map(|method| &method.owner),
                 _ => value.declared_type(),
@@ -3396,7 +3396,7 @@ impl DexJavaDialect {
                 InsnType::Invoke | InsnType::Constructor => operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Method(method) => self.generic_methods.get(method),
                         MemberReference::Field(_) => None,
@@ -3408,7 +3408,7 @@ impl DexJavaDialect {
                 InsnType::Iget | InsnType::Sget => operation
                     .payload
                     .reference
-                    .as_ref()
+                    .as_deref()
                     .and_then(|reference| match reference {
                         MemberReference::Field(field) => self.generic_fields.get(field),
                         MemberReference::Method(_) => None,
@@ -3434,7 +3434,7 @@ impl DexJavaDialect {
                 .first()
                 .is_some_and(|operand| self.expression_declares_concrete_generic_type(operand));
         }
-        let Some(reference) = operation.payload.reference.as_ref() else {
+        let Some(reference) = operation.payload.reference.as_deref() else {
             return false;
         };
         match reference {
@@ -3492,7 +3492,7 @@ impl DexJavaDialect {
         let constructed_type = value
             .as_operation()
             .filter(|operation| operation.insn_type == InsnType::Constructor)
-            .and_then(|operation| operation.payload.reference.as_ref())
+            .and_then(|operation| operation.payload.reference.as_deref())
             .and_then(|reference| match reference {
                 MemberReference::Method(method) => Some(&method.owner),
                 MemberReference::Field(_) => None,
@@ -3582,7 +3582,7 @@ impl DexJavaDialect {
         if operation.insn_type != InsnType::Invoke {
             return false;
         }
-        let Some(MemberReference::Method(method)) = operation.payload.reference.as_ref() else {
+        let Some(MemberReference::Method(method)) = operation.payload.reference.as_deref() else {
             return false;
         };
         let Some(contract) = self.generic_methods.get(method) else {
@@ -3829,7 +3829,7 @@ impl DexJavaDialect {
         &mut self,
         insn: &SemanticOperation,
     ) -> Result<JavaStmt, JavaLoweringError> {
-        let method = Self::method(insn.payload.reference.as_ref())?;
+        let method = Self::method(insn.payload.reference.as_deref())?;
         let receiver = insn
             .operands()
             .first()
@@ -4728,7 +4728,7 @@ impl JavaDialect for DexJavaDialect {
                     && insn
                         .payload
                         .reference
-                        .as_ref()
+                        .as_deref()
                         .is_some_and(|reference| {
                             matches!(reference, MemberReference::Method(method) if method.is_constructor())
                         })
@@ -4741,7 +4741,7 @@ impl JavaDialect for DexJavaDialect {
                 }
             }
             InsnType::FilledNewArray => {
-                let ty = self.source_type(insn.payload.class_type.as_ref().ok_or(
+                let ty = self.source_type(insn.payload.class_type.as_deref().ok_or(
                     JavaLoweringError::MissingPayload {
                         instruction: insn.insn_type,
                         field: "class_type",
@@ -4754,7 +4754,7 @@ impl JavaDialect for DexJavaDialect {
                 }
             }
             InsnType::Iput => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 let value = insn
                     .operands()
                     .first()
@@ -4782,7 +4782,7 @@ impl JavaDialect for DexJavaDialect {
                 }
             }
             InsnType::Sput => {
-                let field = Self::field(insn.payload.reference.as_ref())?;
+                let field = Self::field(insn.payload.reference.as_deref())?;
                 JavaStmt::Assign {
                     target: JavaExpr::StaticField {
                         owner: self.source_type(&field.owner)?,

@@ -484,7 +484,7 @@ impl DecompilerContext {
                     })?;
                     normalize_invoke_args(insn, &method)?;
                     apply_invoke_return_type(insn, &method);
-                    insn.payload.reference = Some(MemberReference::Method(method));
+                    insn.payload.reference = Some(Box::new(MemberReference::Method(method)));
                 }
 
                 // Resolve field references
@@ -500,7 +500,7 @@ impl DecompilerContext {
                         }
                     })?;
                     apply_field_type(insn, &field);
-                    insn.payload.reference = Some(MemberReference::Field(field));
+                    insn.payload.reference = Some(Box::new(MemberReference::Field(field)));
                 }
 
                 // Resolve string references
@@ -510,7 +510,7 @@ impl DecompilerContext {
                             .get_string(dex_idx, string_idx)
                             .ok_or(crate::frontend::DexError::InvalidStringIndex(string_idx))?;
                         insn.payload.string_value =
-                            Some(Utf16String::from_utf16(string.utf16().to_vec()));
+                            Some(Box::new(Utf16String::from_utf16(string.utf16().to_vec())));
                     }
                 }
 
@@ -520,13 +520,14 @@ impl DecompilerContext {
                         let descriptor = reader
                             .get_type(dex_idx, type_idx)
                             .ok_or(crate::frontend::DexError::InvalidTypeIndex(type_idx))?;
-                        insn.payload.class_type =
-                            Some(descriptor.parse::<ArgType>().map_err(|source| {
+                        insn.payload.class_type = Some(Box::new(
+                            descriptor.parse::<ArgType>().map_err(|source| {
                                 crate::frontend::DexError::InvalidDescriptor {
                                     descriptor: descriptor.to_string(),
                                     source,
                                 }
-                            })?);
+                            })?,
+                        ));
                     }
                 }
             }
@@ -1546,7 +1547,7 @@ fn exact_call_targets(cfg: &CFG) -> impl Iterator<Item = MethodReference> + '_ {
                     Some(InvokeType::Static | InvokeType::Direct | InvokeType::Super)
                 )
         })
-        .filter_map(|instruction| match instruction.payload.reference.as_ref() {
+        .filter_map(|instruction| match instruction.payload.reference.as_deref() {
             Some(MemberReference::Method(method)) => Some(method.clone()),
             _ => None,
         })
@@ -1562,7 +1563,7 @@ fn contract_roots<'a>(
             cfg.blocks
                 .values()
                 .flat_map(|block| &block.insns)
-                .filter_map(|instruction| match instruction.payload.reference.as_ref() {
+                .filter_map(|instruction| match instruction.payload.reference.as_deref() {
                     Some(MemberReference::Method(method)) => Some(method.clone()),
                     _ => None,
                 }),
@@ -1614,7 +1615,7 @@ impl SourceAbiClosure {
             .into_iter()
             .flat_map(|cfg| cfg.blocks.values())
             .flat_map(|block| &block.insns)
-            .filter_map(|instruction| instruction.payload.reference.as_ref())
+            .filter_map(|instruction| instruction.payload.reference.as_deref())
         {
             match reference {
                 MemberReference::Field(field) => {

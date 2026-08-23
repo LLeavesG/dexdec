@@ -365,7 +365,7 @@ struct MemberReferenceCollector {
 
 impl crate::ir::SemanticVisitor for MemberReferenceCollector {
     fn enter_operation(&mut self, operation: &crate::ir::SemanticOperation) {
-        match operation.payload.reference.as_ref() {
+        match operation.payload.reference.as_deref() {
             Some(crate::ir::MemberReference::Method(method)) => {
                 self.methods.insert(method.clone());
             }

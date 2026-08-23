@@ -34,12 +34,16 @@ impl PredicateRegionFormation {
             }
             changed = true;
         }
-        let after = SemanticCompletion::analyze(root);
-        if before != after {
-            return Err(SemanticFoldError::CompletionChanged {
-                transform: "predicate-region-formation",
+        if changed {
+            // Only a rewrite can change completion; verifying an untouched
+            // tree would compare it against itself.
+            let after = SemanticCompletion::analyze(root);
+            if before != after {
+                return Err(SemanticFoldError::CompletionChanged {
+                    transform: "predicate-region-formation",
+                }
+                .into());
             }
-            .into());
         }
         Ok(changed)
     }

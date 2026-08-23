@@ -2751,8 +2751,16 @@ impl<'a> SourceTypeFlow<'a> {
         self.definition_states = self.states.clone();
         self.constrain_runtime_type_tests();
 
+        // Element equations are structural: their variable/iterable pair is
+        // fixed once collected, so extract it once here instead of
+        // deep-cloning every expression on every convergence round.
+        let elements = self
+            .elements
+            .iter()
+            .map(|equation| (equation.variable.clone(), equation.iterable.clone()))
+            .collect::<Vec<_>>();
         loop {
-            self.converge_facts();
+            self.converge_facts(&elements);
             let replacements = self.apply_requirements();
             let value_replacements = self.apply_value_requirements();
             if replacements.is_empty() && value_replacements.is_empty() {
@@ -2874,22 +2882,21 @@ impl<'a> SourceTypeFlow<'a> {
             || self.erased_reference_result_fits(equation, requirement)
     }
 
-    fn converge_facts(&mut self) {
+    fn converge_facts(&mut self, elements: &[(RegisterArg, SemanticExpression)]) {
         loop {
             let mut changed = self.converge_equations();
-            for index in 0..self.elements.len() {
-                let equation = self.elements[index].clone();
-                if let Some(element) = self.iterable_element_type(&equation.iterable) {
-                    changed |= self.constrain_register(&equation.variable, element);
+            for (variable, iterable) in elements {
+                if let Some(element) = self.iterable_element_type(iterable) {
+                    changed |= self.constrain_register(variable, element);
                 }
                 let element = self
-                    .register_type(&equation.variable)
+                    .register_type(variable)
                     .cloned()
-                    .or_else(|| self.resolved_type(&equation.variable.ty));
-                if let Some(expected) = element
-                    .and_then(|element| self.iterable_context_type(&equation.iterable, element))
+                    .or_else(|| self.resolved_type(&variable.ty));
+                if let Some(expected) =
+                    element.and_then(|element| self.iterable_context_type(iterable, element))
                 {
-                    changed |= self.constrain_expression_context(&equation.iterable, expected);
+                    changed |= self.constrain_expression_context(iterable, expected);
                 }
             }
             for index in self.equation_graph.take_dirty_invocations() {

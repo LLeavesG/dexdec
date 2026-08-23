@@ -20,11 +20,15 @@ impl LoopInvariantMotion {
         let body = std::mem::replace(root, SemanticNode::Empty);
         let mut motion = Self { changed: false };
         *root = motion.fold_node(body)?;
-        let after = crate::ir::semantic::SemanticCompletion::analyze(root);
-        if before != after {
-            return Err(SemanticFoldError::CompletionChanged {
-                transform: "loop-invariant-motion",
-            });
+        if motion.changed {
+            // Only a rewrite can change completion; verifying an untouched
+            // tree would compare it against itself.
+            let after = crate::ir::semantic::SemanticCompletion::analyze(root);
+            if before != after {
+                return Err(SemanticFoldError::CompletionChanged {
+                    transform: "loop-invariant-motion",
+                });
+            }
         }
         Ok(motion.changed)
     }

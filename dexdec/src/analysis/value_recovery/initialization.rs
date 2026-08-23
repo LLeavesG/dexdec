@@ -24,12 +24,16 @@ impl SourceInitializationRecovery {
         let before = crate::ir::semantic::SemanticCompletion::analyze(&original);
         let mut recovery = Self { changed: false };
         let rewritten = recovery.fold_node(original)?;
-        let after = crate::ir::semantic::SemanticCompletion::analyze(&rewritten);
-        if !before.same_control_outcomes(&after) {
-            return Err(SemanticFoldError::CompletionChanged {
-                transform: "source-initialization",
+        if recovery.changed {
+            // Only a rewrite can change completion; verifying an untouched
+            // fold result would compare the tree against itself.
+            let after = crate::ir::semantic::SemanticCompletion::analyze(&rewritten);
+            if !before.same_control_outcomes(&after) {
+                return Err(SemanticFoldError::CompletionChanged {
+                    transform: "source-initialization",
+                }
+                .into());
             }
-            .into());
         }
         *root = rewritten;
         Ok(recovery.changed)
